@@ -148,7 +148,8 @@ pub struct VolumeSpec {
     pub gain: f32,
 }
 
-pub const MAX_VOLUME: f32 = 4.0;
+/// Highest volume you can type in (1000%).
+pub const MAX_VOLUME: f32 = 10.0;
 
 /// One audio-processing node that runs inside the daemon.
 #[derive(Debug, Clone, PartialEq)]

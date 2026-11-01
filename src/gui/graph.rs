@@ -674,7 +674,7 @@ fn levels_editor(ui: &mut Ui, node: NodeId, l: &mut LevelsSpec, reading: Option<
     }
 }
 
-/// Volume: a vertical fader in dB (bottom = silent) next to an output meter.
+/// Volume: a linear 0–200% slider (type a number for anything beyond), with a level meter.
 fn volume_editor(ui: &mut Ui, v: &mut VolumeSpec, reading: Option<Reading>) {
     ui.horizontal(|ui| {
         ui.label("Name");
@@ -685,37 +685,32 @@ fn volume_editor(ui: &mut Ui, v: &mut VolumeSpec, reading: Option<Reading>) {
             }
         }
     });
-    const FLOOR: f32 = -60.0;
-    let max_db = dsp::lin_to_db(MAX_VOLUME);
-    ui.horizontal(|ui| {
-        let mut db = if v.gain <= 0.0 { FLOOR } else { dsp::lin_to_db(v.gain).max(FLOOR) };
-        let r = ui.add(egui::Slider::new(&mut db, FLOOR..=max_db).vertical().show_value(false).step_by(0.5));
-        if r.changed() {
-            v.gain = if db <= FLOOR { 0.0 } else { dsp::db_to_lin(db) };
+    let mut pct = v.gain * 100.0;
+    let r = ui.horizontal(|ui| {
+        ui.spacing_mut().slider_width = 170.0;
+        // Never clamps: a typed value past 200% stays (up to the maximum below).
+        let r = ui.add(
+            egui::Slider::new(&mut pct, 0.0..=200.0)
+                .clamping(egui::SliderClamping::Never)
+                .step_by(1.0)
+                .suffix("%")
+                .max_decimals(0),
+        );
+        if ui.small_button("100%").clicked() {
+            pct = 100.0;
         }
-        if r.double_clicked() {
-            v.gain = 1.0;
-        }
-        // Output meter on the same scale as the fader.
-        let (rect, _) = ui.allocate_exact_size(vec2(10.0, r.rect.height()), Sense::hover());
-        let painter = ui.painter();
-        painter.rect_filled(rect, 2.0, Color32::from_gray(22));
-        if let Some(p) = reading.map(|r| r.out_peak) {
-            let t = ((dsp::lin_to_db(p) - FLOOR) / (max_db - FLOOR)).clamp(0.0, 1.0);
-            let top = rect.bottom() - rect.height() * t;
-            painter.rect_filled(Rect::from_min_max(Pos2::new(rect.left(), top), rect.right_bottom()), 2.0, GREEN);
-        }
-        ui.vertical(|ui| {
-            ui.label(RichText::new(format!("{:.0}%", v.gain * 100.0)).strong());
-            let db_text = if v.gain <= 0.0 { "muted".to_owned() } else { format!("{:+.1} dB", dsp::lin_to_db(v.gain)) };
-            ui.label(RichText::new(db_text).small().weak());
-            ui.add(egui::DragValue::new(&mut v.gain).range(0.0..=MAX_VOLUME).speed(0.01).custom_formatter(|g, _| format!("×{g:.2}")));
-            if ui.small_button("100%").clicked() {
-                v.gain = 1.0;
-            }
-            ui.label(RichText::new("double-click the fader\nto reset").small().weak());
-        });
+        r
     });
+    let r = r.inner;
+    if r.double_clicked() {
+        pct = 100.0;
+    }
+    v.gain = (pct / 100.0).clamp(0.0, MAX_VOLUME);
+    // Output meter, -60 to +6 dB like the Levels node.
+    let (rect, _) = ui.allocate_exact_size(vec2(170.0, 6.0), Sense::hover());
+    meter_bar(ui.painter(), rect, reading.map(|r| r.out_peak));
+    let db_text = if v.gain <= 0.0 { "muted".to_owned() } else { format!("{:+.1} dB", dsp::lin_to_db(v.gain)) };
+    ui.label(RichText::new(format!("{db_text} · type a number for more than 200%")).small().weak());
 }
 
 /// A neutral starting point: four bells spread over the spectrum, all at 0 dB.
