@@ -271,6 +271,17 @@ impl NodeKind {
             _ => None,
         }
     }
+    /// The name that must be unique in the graph: owned PipeWire names and switch names.
+    pub fn unique_name_mut(&mut self) -> Option<&mut String> {
+        match self {
+            NodeKind::Bus(b) => Some(&mut b.name),
+            NodeKind::Eq(e) => Some(&mut e.name),
+            NodeKind::Levels(l) => Some(&mut l.name),
+            NodeKind::Volume(v) => Some(&mut v.name),
+            NodeKind::SwitchOutput { name, .. } | NodeKind::SwitchInput { name, .. } => Some(name),
+            _ => None,
+        }
+    }
     /// The PipeWire `node.name` this node owns (virtual devices and processing nodes).
     pub fn owned_name(&self) -> Option<&str> {
         match self {

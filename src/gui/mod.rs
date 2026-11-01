@@ -3,6 +3,7 @@
 //! The GUI never changes routing itself. It watches PipeWire read-only, edits the graph file,
 //! and asks the daemon to apply it.
 
+mod clipboard;
 mod graph;
 
 use crate::engine::{self, Cmd, EngineConfig};
@@ -79,6 +80,8 @@ struct App {
     fit_pending: bool,
     snarl: Snarl<NodeKind>,
     style: SnarlStyle,
+    /// Graph-to-screen transform of the last frame (for pasting at the pointer).
+    graph_transform: Option<egui::emath::TSTransform>,
     dialog: Option<Dialog>,
     dragging: HashMap<u32, (f32, Instant)>,
     labels: model::Labels,
@@ -208,6 +211,17 @@ impl App {
             node_layout: Some(NodeLayout::coil()),
             pin_placement: Some(PinPlacement::Edge),
             pin_size: Some(9.0),
+            // Selected nodes get a lighter blue than the box drawn while selecting.
+            select_style: Some({
+                let s = cc.egui_ctx.style_of(egui::Theme::Dark);
+                let light = egui::Color32::from_rgb(140, 200, 255);
+                egui_snarl::ui::SelectionStyle {
+                    margin: s.spacing.window_margin,
+                    rounding: s.visuals.window_corner_radius,
+                    fill: light.gamma_multiply(0.18),
+                    stroke: egui::Stroke::new(1.5, light),
+                }
+            }),
             ..SnarlStyle::new()
         };
         let mut app = App {
@@ -225,6 +239,7 @@ impl App {
             fit_pending: true,
             snarl: Snarl::new(),
             style,
+            graph_transform: None,
             dialog: None,
             dragging: HashMap::new(),
             labels: model::load_labels(),
@@ -253,6 +268,44 @@ impl App {
                 self.saved = graph::from_snarl(&self.snarl);
             }
             Err(e) => self.notify(format!("{e:#}"), true),
+        }
+    }
+
+    /// Copy, cut, paste and delete of the selected nodes, unless a text field or shortcut
+    /// field has the keyboard.
+    fn edit_shortcuts(&mut self, ui: &egui::Ui) {
+        let ctx = ui.ctx();
+        if ctx.text_edit_focused() || graph::capturing_keys(ctx) {
+            return;
+        }
+        let events = ctx.input(|i| i.events.clone());
+        let selected = egui_snarl::ui::get_selected_nodes(graph_id(), ctx);
+        for event in events {
+            match event {
+                egui::Event::Copy | egui::Event::Cut if !selected.is_empty() => {
+                    if let Some(text) = clipboard::copy(&self.snarl, &selected) {
+                        ctx.copy_text(text);
+                    }
+                    if event == egui::Event::Cut {
+                        clipboard::remove(&mut self.snarl, &selected);
+                    }
+                }
+                egui::Event::Paste(text) => {
+                    // At the pointer, if it's over the graph.
+                    let at = ctx
+                        .pointer_latest_pos()
+                        .filter(|p| ui.max_rect().contains(*p))
+                        .zip(self.graph_transform)
+                        .map(|(p, t)| t.inverse() * p);
+                    if let Some(new) = clipboard::paste(&mut self.snarl, &text, at) {
+                        egui_snarl::ui::set_selected_nodes(graph_id(), ctx, new);
+                    }
+                }
+                egui::Event::Key { key: egui::Key::Delete, pressed: true, modifiers, .. } if !modifiers.any() => {
+                    clipboard::remove(&mut self.snarl, &selected);
+                }
+                _ => {}
+            }
         }
     }
 
@@ -686,6 +739,7 @@ impl eframe::App for App {
             let shows_levels = profile.nodes.iter().any(|n| n.kind.filter().is_some());
             self.want_levels.store(shows_levels && info.status.is_some(), Ordering::Relaxed);
             let readings = self.readings.lock().unwrap().clone();
+            self.edit_shortcuts(ui);
             let mut viewer = graph::Viewer {
                 live: &live,
                 resolved: &resolved,
@@ -694,16 +748,18 @@ impl eframe::App for App {
                 running: info.status.is_some(),
                 select: None,
                 fit_to: std::mem::take(&mut self.fit_pending).then(|| ui.max_rect()),
+                transform: None,
                 defaults: (plan.default_sink, plan.default_source),
                 labels: &mut self.labels,
                 labels_changed: false,
                 changed: false,
             };
             SnarlWidget::new()
-                .id(egui::Id::new("graph"))
+                .id(graph_id())
                 .style(self.style)
                 .show(&mut self.snarl, &mut viewer, ui);
             let (labels_changed, select) = (viewer.labels_changed, viewer.select.take());
+            self.graph_transform = viewer.transform.or(self.graph_transform);
             if let Some((switch, pin)) = select {
                 self.select(switch, pin);
             }
@@ -714,14 +770,18 @@ impl eframe::App for App {
                 self.notify(format!("saving labels: {e:#}"), true);
             }
             ui.put(
-                egui::Rect::from_min_size(ui.max_rect().left_top() + egui::vec2(8.0, 6.0), egui::vec2(420.0, 18.0)),
-                egui::Label::new(RichText::new("Right-click to add nodes · drag from out to in to connect").small().weak()),
+                egui::Rect::from_min_size(ui.max_rect().left_top() + egui::vec2(8.0, 6.0), egui::vec2(700.0, 18.0)),
+                egui::Label::new(RichText::new("Right-click to add nodes · drag out → in to connect · drag to select · right-drag to pan · Ctrl+C / Ctrl+V / Del").small().weak()),
             );
         });
         self.dialogs(&ctx);
         self.sync_preview(&ctx, info.status.is_some());
         debug_screenshot(&ctx);
     }
+}
+
+fn graph_id() -> egui::Id {
+    egui::Id::new("graph")
 }
 
 /// `BSP_SCREENSHOT=out.ppm bsp gui` saves a picture of this window (only) once it has

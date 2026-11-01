@@ -67,6 +67,8 @@ pub struct Viewer<'a> {
     pub select: Option<(String, u32)>,
     /// Set to the graph area to zoom and pan so every node fits in it (once).
     pub fit_to: Option<Rect>,
+    /// Set to the graph-to-screen transform used this frame.
+    pub transform: Option<egui::emath::TSTransform>,
     /// What the "Other apps" nodes made the default output / input (live ids).
     pub defaults: (Option<u32>, Option<u32>),
     /// Your names for devices (node.name -> label), edited in place.
@@ -303,6 +305,7 @@ impl SnarlViewer<NodeKind> for Viewer<'_> {
         {
             *to_global = t;
         }
+        self.transform = Some(*to_global);
     }
 
     fn title(&mut self, node: &NodeKind) -> String {
@@ -570,6 +573,14 @@ fn pin_text(k: usize, label: &str) -> String {
 
 /// A button showing a keyboard shortcut. Click it, then press the keys; Esc cancels,
 /// Backspace clears. Returns whether the key changed.
+const KEY_CAPTURE: &str = "bsp-key-capture-frame";
+
+/// Whether a shortcut field was waiting for keys last frame.
+pub fn capturing_keys(ctx: &egui::Context) -> bool {
+    let last: Option<u64> = ctx.data(|d| d.get_temp(egui::Id::new(KEY_CAPTURE)));
+    last.is_some_and(|f| f + 1 >= ctx.cumulative_frame_nr())
+}
+
 fn key_field(ui: &mut Ui, id: impl std::hash::Hash + std::fmt::Debug, key: &mut String) -> bool {
     let id = egui::Id::new(("key-capture", id));
     let capturing: bool = ui.data(|d| d.get_temp(id)).unwrap_or(false);
@@ -605,6 +616,11 @@ fn key_field(ui: &mut Ui, id: impl std::hash::Hash + std::fmt::Debug, key: &mut 
         }
     }
     let capturing: bool = ui.data(|d| d.get_temp(id)).unwrap_or(false);
+    if capturing {
+        // Keep editor shortcuts (copy, paste, delete) from acting on these keys.
+        let frame = ui.ctx().cumulative_frame_nr();
+        ui.data_mut(|d| d.insert_temp(egui::Id::new(KEY_CAPTURE), frame));
+    }
     let text = if capturing {
         RichText::new("press keys…").color(AMBER)
     } else if key.is_empty() {
@@ -741,7 +757,11 @@ fn volume_editor(ui: &mut Ui, v: &mut VolumeSpec, reading: Option<Reading>) {
     if r.double_clicked() {
         pct = 100.0;
     }
-    v.gain = (pct / 100.0).clamp(0.0, MAX_VOLUME);
+    // Only write back real changes: gain -> % -> gain isn't exact in floats, and a drift of
+    // one bit would count as an unsaved edit.
+    if pct != v.gain * 100.0 {
+        v.gain = (pct / 100.0).clamp(0.0, MAX_VOLUME);
+    }
     // Output meter, -60 to +6 dB like the Levels node.
     let (rect, _) = ui.allocate_exact_size(vec2(170.0, 6.0), Sense::hover());
     meter_bar(ui.painter(), rect, reading.map(|r| r.out_peak));
@@ -971,3 +991,4 @@ fn eq_editor(ui: &mut Ui, node: NodeId, eq: &mut EqSpec) {
     });
     ui.data_mut(|d| d.insert_temp(sel_id, selected));
 }
+
