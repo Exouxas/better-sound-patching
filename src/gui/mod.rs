@@ -64,6 +64,11 @@ struct App {
     dialog: Option<Dialog>,
     dragging: HashMap<u32, (f32, Instant)>,
     labels: model::Labels,
+    /// Last unsaved version of the active profile sent to the daemon for live preview.
+    preview_sent: Option<Profile>,
+    preview_at: Instant,
+    /// The daemon is currently playing unsaved edits.
+    previewing: bool,
     _engine: pipewire::channel::Sender<Cmd>,
 }
 
@@ -162,6 +167,9 @@ impl App {
             dialog: None,
             dragging: HashMap::new(),
             labels: model::load_labels(),
+            preview_sent: None,
+            preview_at: Instant::now(),
+            previewing: false,
             _engine: engine,
         };
         app.refresh_profiles();
@@ -180,6 +188,7 @@ impl App {
     }
 
     fn open_profile(&mut self, name: &str) {
+        self.drop_preview();
         match model::load_profile(name) {
             Ok(p) => {
                 self.snarl = graph::to_snarl(&p);
@@ -208,12 +217,14 @@ impl App {
         let profile = self.current();
         let dupes = duplicate_bus_names(&profile);
         if !dupes.is_empty() {
-            self.notify(format!("Two virtual devices share a name: {}", dupes.join(", ")), true);
+            self.notify(format!("Two virtual devices or EQs share a name: {}", dupes.join(", ")), true);
             return;
         }
         match model::save_profile(&name, &profile) {
             Ok(()) => {
                 self.saved = profile;
+                self.preview_sent = None;
+                self.previewing = false;
                 let status = self.daemon.lock().unwrap().status.clone();
                 if status.and_then(|s| s.active_profile).as_deref() == Some(name.as_str()) {
                     match ipc::request(&Request::Reload) {
@@ -239,6 +250,42 @@ impl App {
         } else {
             let _ = model::save_state(&model::AppState { active_profile: Some(name.to_owned()) });
             self.notify(format!("{name} will be used when the new system runs"), false);
+        }
+    }
+
+    /// Edits to the active profile play live while the new system runs (about 30 updates a
+    /// second while dragging). Save makes them permanent; leaving without saving reverts them.
+    fn sync_preview(&mut self, ctx: &egui::Context, active: Option<&str>, daemon_running: bool) {
+        if !daemon_running || self.editing.is_none() || active != self.editing.as_deref() {
+            return;
+        }
+        let current = self.current();
+        let last = self.preview_sent.as_ref().unwrap_or(&self.saved);
+        if current == *last {
+            return;
+        }
+        if self.preview_at.elapsed() < Duration::from_millis(33) {
+            ctx.request_repaint_after(Duration::from_millis(35));
+            return;
+        }
+        self.preview_at = Instant::now();
+        self.previewing = current != self.saved;
+        self.preview_sent = Some(current.clone());
+        let toast = self.toast.clone();
+        std::thread::spawn(move || {
+            if let Ok(Response::Error(e)) | Err(e) = ipc::request(&Request::Preview { profile: current }).map_err(|e| format!("{e:#}")) {
+                *toast.lock().unwrap() = Some((e, true, Instant::now()));
+            }
+        });
+    }
+
+    /// Throw away live, unsaved edits: the daemon goes back to the saved profile.
+    fn drop_preview(&mut self) {
+        self.preview_sent = None;
+        if std::mem::take(&mut self.previewing) {
+            std::thread::spawn(|| {
+                let _ = ipc::request(&Request::Reload);
+            });
         }
     }
 
@@ -352,9 +399,10 @@ impl App {
                     } else {
                         ui.label(RichText::new("Your normal setup is in charge").color(Color32::GRAY));
                         if ui.add_enabled(!busy, egui::Button::new("Try the new system…")).clicked() {
+                            let defaults = session::default_conflicts();
                             let pause = KNOWN_CONFLICTS
                                 .iter()
-                                .map(|(n, _)| (*n, *n == "qpwgraph" && info.running.get(n).copied().unwrap_or(false)))
+                                .map(|(n, _)| (*n, defaults.iter().any(|d| d == n) && info.running.get(n).copied().unwrap_or(false)))
                                 .collect();
                             self.dialog = Some(Dialog::Trial { pause });
                         }
@@ -367,6 +415,10 @@ impl App {
                         }
                     }
                 }
+            }
+            if self.previewing && self.dirty() {
+                ui.separator();
+                ui.label(RichText::new("Your unsaved changes are playing live — Save to keep them").color(Color32::from_rgb(120, 190, 240)));
             }
             if busy {
                 ui.spinner();
@@ -612,10 +664,10 @@ fn starter_profile() -> Profile {
             bus(1, 300.0, 50.0, "system-in", BusKind::Playback, Channels::Stereo),
             bus(2, 300.0, 250.0, "communication-in", BusKind::Playback, Channels::Stereo),
             bus(3, 650.0, 450.0, "system-out", BusKind::Microphone, Channels::Mono),
-            GraphNode { id: 4, pos: [700.0, 120.0], kind: NodeKind::FallbackOutput },
-            GraphNode { id: 5, pos: [250.0, 450.0], kind: NodeKind::FallbackInput },
+            GraphNode { id: 4, pos: [0.0, 60.0], kind: NodeKind::OtherAppsPlayback },
+            GraphNode { id: 5, pos: [1000.0, 450.0], kind: NodeKind::OtherAppsRecording },
         ],
-        wires: vec![],
+        wires: vec![model::Wire::new(4, 1), model::Wire::new(3, 5)],
     }
 }
 
@@ -623,16 +675,26 @@ fn duplicate_bus_names(p: &Profile) -> Vec<String> {
     let mut seen = std::collections::HashSet::new();
     let mut dupes = vec![];
     for n in &p.nodes {
-        if let NodeKind::Bus(b) = &n.kind
-            && !seen.insert(b.name.clone())
-        {
-            dupes.push(b.name.clone());
+        let name = match &n.kind {
+            NodeKind::Bus(b) => &b.name,
+            NodeKind::Eq(e) => &e.name,
+            _ => continue,
+        };
+        if !seen.insert(name.clone()) {
+            dupes.push(name.clone());
         }
     }
     dupes
 }
 
 impl eframe::App for App {
+    fn on_exit(&mut self) {
+        // Closing without saving: don't leave unsaved edits playing.
+        if self.previewing {
+            let _ = ipc::request(&Request::Reload);
+        }
+    }
+
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
         if ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::S)) {
@@ -673,10 +735,13 @@ impl eframe::App for App {
                 return;
             }
             let profile = self.current();
+            let plan = planner::plan(&profile, &live);
             let resolved = planner::resolve(&profile, &live);
             let mut viewer = graph::Viewer {
                 live: &live,
                 resolved: &resolved,
+                active_slots: &plan.active_slots,
+                defaults: (plan.default_sink, plan.default_source),
                 labels: &mut self.labels,
                 labels_changed: false,
                 changed: false,
@@ -697,5 +762,32 @@ impl eframe::App for App {
             );
         });
         self.dialogs(&ctx);
+        self.sync_preview(&ctx, active.as_deref(), info.status.is_some());
+        debug_screenshot(&ctx);
     }
+}
+
+/// `BSP_SCREENSHOT=out.ppm bsp gui` saves a picture of this window (only) once it has
+/// settled, then quits. For checking the UI without screenshotting the whole desktop.
+fn debug_screenshot(ctx: &egui::Context) {
+    let Some(path) = std::env::var_os("BSP_SCREENSHOT") else { return };
+    let frame = ctx.cumulative_frame_nr();
+    if frame == 40 {
+        ctx.send_viewport_cmd(egui::ViewportCommand::Screenshot(Default::default()));
+    }
+    let shot = ctx.input(|i| {
+        i.events.iter().find_map(|e| match e {
+            egui::Event::Screenshot { image, .. } => Some(image.clone()),
+            _ => None,
+        })
+    });
+    if let Some(img) = shot {
+        let mut out = format!("P6\n{} {}\n255\n", img.size[0], img.size[1]).into_bytes();
+        for p in &img.pixels {
+            out.extend_from_slice(&[p.r(), p.g(), p.b()]);
+        }
+        let _ = std::fs::write(path, out);
+        ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+    }
+    ctx.request_repaint();
 }

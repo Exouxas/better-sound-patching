@@ -14,6 +14,8 @@ pub enum Request {
     Reload,
     /// Activate a profile.
     Switch { profile: String },
+    /// Apply the editor's unsaved version of the active profile live. Dropped on reload/switch.
+    Preview { profile: crate::model::Profile },
     /// Stop the daemon. Its links and buses disappear with it.
     Stop { restore_paused: bool },
 }
@@ -26,6 +28,8 @@ pub struct Status {
     pub paused: Vec<String>,
     pub links_owned: usize,
     pub buses_owned: Vec<String>,
+    #[serde(default)]
+    pub eqs_running: Vec<String>,
     pub last_error: Option<String>,
 }
 

@@ -21,6 +21,27 @@ pub const KNOWN_CONFLICTS: &[(&str, &str)] = &[
     ("easyeffects", "Its effect chains link themselves to devices. Pause it unless your profile routes through it."),
 ];
 
+/// Which conflicting programs to pause/disable by default: qpwgraph always, EasyEffects
+/// unless the active profile still routes through its devices.
+pub fn default_conflicts() -> Vec<String> {
+    let uses_easyeffects = model::load_state()
+        .active_profile
+        .and_then(|p| model::load_profile(&p).ok())
+        .is_some_and(|p| {
+            p.nodes.iter().any(|n| match &n.kind {
+                model::NodeKind::Input { device: Some(d) } | model::NodeKind::Output { device: Some(d) } => {
+                    d.node_name.starts_with("easyeffects")
+                }
+                _ => false,
+            })
+        });
+    let mut v = vec!["qpwgraph".to_owned()];
+    if !uses_easyeffects {
+        v.push("easyeffects".to_owned());
+    }
+    v
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PausedApp {
     pub name: String,
@@ -119,6 +140,17 @@ fn stop_process(process: &str) {
     }
 }
 
+/// Relaunched programs log next to the daemon, so a failed relaunch leaves a trace.
+fn app_log() -> Stdio {
+    let path = ipc::socket_path().with_file_name("better-sound-patching-apps.log");
+    std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .map(Stdio::from)
+        .unwrap_or_else(|_| Stdio::null())
+}
+
 fn launch_detached(cmd: &[String]) -> Result<()> {
     let Some((bin, args)) = cmd.split_first() else { bail!("empty command") };
     Command::new("setsid")
@@ -126,8 +158,8 @@ fn launch_detached(cmd: &[String]) -> Result<()> {
         .arg(bin)
         .args(args)
         .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        .stdout(app_log())
+        .stderr(app_log())
         .status()
         .with_context(|| format!("launching {bin}"))?;
     Ok(())
@@ -160,16 +192,51 @@ pub fn restore_paused() -> Result<Vec<String>> {
     let Ok(text) = std::fs::read_to_string(paused_record()) else { return Ok(vec![]) };
     let paused: Vec<PausedApp> = serde_json::from_str(&text).unwrap_or_default();
     let mut restored = vec![];
+    let mut failed = vec![];
     for app in paused {
-        if is_running(&app.name) {
-            continue;
+        if is_running(&app.name) || relaunch(&app) {
+            restored.push(app.name);
+        } else {
+            failed.push(app);
         }
-        log::info!("relaunching {}", app.name);
-        launch_detached(&app.relaunch)?;
-        restored.push(app.name);
     }
-    let _ = std::fs::remove_file(paused_record());
-    Ok(restored)
+    if failed.is_empty() {
+        let _ = std::fs::remove_file(paused_record());
+        Ok(restored)
+    } else {
+        // Keep the record so the GUI's restore button and `bsp restore` can try again.
+        let names: Vec<_> = failed.iter().map(|a| a.name.clone()).collect();
+        let _ = model::write_atomic(&paused_record(), &serde_json::to_string(&failed)?);
+        bail!("could not relaunch {}", names.join(", "))
+    }
+}
+
+/// Launch a paused program and make sure it stays up. Some programs (qpwgraph) leave a stale
+/// single-instance lock when killed: the next launch quietly exits after clearing it, and the
+/// one after that works. So retry until the process survives a short grace period.
+fn relaunch(app: &PausedApp) -> bool {
+    for attempt in 1..=3 {
+        log::info!("relaunching {} (attempt {attempt})", app.name);
+        if let Err(e) = launch_detached(&app.relaunch) {
+            log::error!("{e:#}");
+            return false;
+        }
+        let deadline = Instant::now() + Duration::from_millis(2500);
+        let mut alive_since = None;
+        while Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(100));
+            match (is_running(&app.name), alive_since) {
+                (true, None) => alive_since = Some(Instant::now()),
+                (true, Some(t)) if t.elapsed() > Duration::from_millis(1500) => return true,
+                (false, _) => alive_since = None,
+                _ => {}
+            }
+        }
+        if is_running(&app.name) {
+            return true;
+        }
+    }
+    false
 }
 
 pub fn paused_pending() -> Vec<PausedApp> {

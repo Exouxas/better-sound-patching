@@ -11,6 +11,16 @@ pub struct LiveNode {
     pub media_class: String,
     /// Set for nodes that belong to a physical device (ALSA, Bluetooth, ...).
     pub device_id: Option<u32>,
+    /// For app streams: `application.process.binary` and `application.name`.
+    #[serde(default)]
+    pub app_binary: String,
+    #[serde(default)]
+    pub app_name: String,
+    #[serde(default)]
+    pub client_id: Option<u32>,
+    /// A level meter (pavucontrol, the volume applet): never routed.
+    #[serde(default)]
+    pub meter: bool,
 }
 
 impl LiveNode {
@@ -28,6 +38,15 @@ impl LiveNode {
     }
     pub fn is_source(&self) -> bool {
         self.media_class.starts_with("Audio/Source") || self.media_class == "Audio/Duplex"
+    }
+    /// An audio stream belonging to a program (playback or recording).
+    pub fn is_app_stream(&self) -> bool {
+        matches!(self.media_class.as_str(), "Stream/Output/Audio" | "Stream/Input/Audio")
+            && !self.app_binary.is_empty()
+            && !self.meter
+    }
+    pub fn is_playback_stream(&self) -> bool {
+        self.media_class == "Stream/Output/Audio"
     }
     pub fn label(&self) -> &str {
         if self.description.is_empty() { &self.name } else { &self.description }
@@ -49,6 +68,10 @@ pub struct LivePort {
     pub channel: String,
     /// Index of the port within its node (`port.id`), used for stable ordering.
     pub index: u32,
+    /// A monitor port: a copy of what the node receives. On a recording stream that's the
+    /// microphone itself, so it must never be routed as the program's output.
+    #[serde(default)]
+    pub monitor: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -65,6 +88,10 @@ pub struct Live {
     pub nodes: BTreeMap<u32, LiveNode>,
     pub ports: BTreeMap<u32, LivePort>,
     pub links: BTreeMap<u32, LiveLink>,
+    /// Client id -> executable name (`application.process.binary`), which identifies the
+    /// program behind each stream.
+    #[serde(default)]
+    pub clients: BTreeMap<u32, String>,
 }
 
 impl Live {
@@ -78,6 +105,7 @@ impl Live {
             .ports
             .values()
             .filter(|p| p.node_id == node_id && p.dir == dir)
+            .filter(|p| !(p.monitor && self.nodes.get(&node_id).is_some_and(|n| n.media_class.starts_with("Stream/"))))
             .collect();
         v.sort_by_key(|p| (p.index, p.id));
         v

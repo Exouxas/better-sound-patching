@@ -1,4 +1,6 @@
+mod dsp;
 mod engine;
+mod eqnode;
 mod gui;
 mod ipc;
 mod live;
@@ -28,7 +30,8 @@ enum Cmd {
     },
     /// Start a trial session in the background (nothing persistent changes).
     Trial {
-        #[arg(long, default_values = ["qpwgraph"])]
+        /// Programs to pause. Default: qpwgraph, plus easyeffects if your profile doesn't use it.
+        #[arg(long)]
         pause: Vec<String>,
     },
     /// Stop the daemon and give control back to your old setup.
@@ -43,7 +46,8 @@ enum Cmd {
     Profiles,
     /// Make the new system start at login. Moves the given programs' autostart entries aside.
     Approve {
-        #[arg(long, default_values = ["qpwgraph"])]
+        /// Default: qpwgraph, plus easyeffects if your profile doesn't use it.
+        #[arg(long)]
         disable: Vec<String>,
     },
     /// Undo `approve` and bring the old setup back.
@@ -53,14 +57,15 @@ enum Cmd {
 }
 
 fn main() -> Result<()> {
-    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("warn,bsp=info")).init();
     let cli = Cli::parse();
     match cli.cmd.unwrap_or(Cmd::Gui) {
         Cmd::Gui => gui::run(),
         Cmd::Daemon { pause } => session::run_daemon(&pause),
         Cmd::Trial { pause } => {
+            let pause = if pause.is_empty() { session::default_conflicts() } else { pause };
             session::start_trial(&pause)?;
-            println!("trial running. `bsp stop` (or a reboot) brings your old setup back");
+            println!("trial running (paused: {}). `bsp stop` (or a reboot) brings your old setup back", pause.join(", "));
             Ok(())
         }
         Cmd::Stop => session::stop_daemon(true),
@@ -102,6 +107,7 @@ fn main() -> Result<()> {
             Ok(())
         }
         Cmd::Approve { disable } => {
+            let disable = if disable.is_empty() { session::default_conflicts() } else { disable };
             session::approve(&disable)?;
             println!("approved: the routing daemon now starts at login. `revert` undoes this.");
             Ok(())
@@ -160,6 +166,13 @@ fn print_plan(name: &str) -> Result<()> {
         let state = if live.node_by_name(&b.name).is_some() { "exists (adopted)" } else { "would create" };
         println!("  {:<24} {state}", b.name);
     }
+    if !plan.eqs.is_empty() {
+        println!("\nequalizers:");
+        for e in &plan.eqs {
+            let state = if live.node_by_name(&e.name).is_some() { "running" } else { "would start (links through it are made then)" };
+            println!("  {:<24} {} band(s), {state}", e.name, e.bands.len());
+        }
+    }
     println!("\nlinks:");
     for &(o, i) in &plan.links {
         let state = if existing.contains(&(o, i)) { "ok     " } else { "create " };
@@ -170,10 +183,19 @@ fn print_plan(name: &str) -> Result<()> {
         let l = live.links[id];
         println!("  remove  {} -> {}", port(l.out_port), port(l.in_port));
     }
+    if !plan.missing.is_empty() {
+        println!();
+    }
     for id in &plan.missing {
-        if let Some(n) = profile.nodes.iter().find(|n| n.id == *id) {
-            println!("\nwaiting for device (not present): {:?}", n.kind);
+        match profile.nodes.iter().find(|n| n.id == *id).map(|n| &n.kind) {
+            Some(model::NodeKind::Input { device: Some(d) } | model::NodeKind::Output { device: Some(d) }) => {
+                println!("waiting for device: {} (not plugged in)", d.description)
+            }
+            Some(model::NodeKind::App { app: Some(a) }) => println!("waiting for app: {} (not playing or recording)", a.binary),
+            _ => {}
         }
     }
+    let name_of = |id: Option<u32>| id.and_then(|id| live.nodes.get(&id)).map_or("unchanged".into(), |n| n.label().to_owned());
+    println!("\ndefault output: {}\ndefault input:  {}", name_of(plan.default_sink), name_of(plan.default_source));
     Ok(())
 }

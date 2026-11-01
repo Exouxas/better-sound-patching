@@ -51,6 +51,75 @@ impl BusSpec {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum BandKind {
+    #[default]
+    Bell,
+    LowShelf,
+    HighShelf,
+    LowPass,
+    HighPass,
+    Notch,
+}
+
+impl BandKind {
+    pub const ALL: [BandKind; 6] =
+        [BandKind::Bell, BandKind::LowShelf, BandKind::HighShelf, BandKind::LowPass, BandKind::HighPass, BandKind::Notch];
+    pub fn label(self) -> &'static str {
+        match self {
+            BandKind::Bell => "Bell",
+            BandKind::LowShelf => "Low shelf",
+            BandKind::HighShelf => "High shelf",
+            BandKind::LowPass => "Low pass",
+            BandKind::HighPass => "High pass",
+            BandKind::Notch => "Notch",
+        }
+    }
+    /// Whether the gain setting does anything for this filter type.
+    pub fn has_gain(self) -> bool {
+        matches!(self, BandKind::Bell | BandKind::LowShelf | BandKind::HighShelf)
+    }
+}
+
+fn yes() -> bool {
+    true
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct Band {
+    #[serde(default)]
+    pub kind: BandKind,
+    /// Hz
+    pub freq: f32,
+    #[serde(default)]
+    pub gain_db: f32,
+    pub q: f32,
+    #[serde(default = "yes")]
+    pub enabled: bool,
+}
+
+pub const MAX_BANDS: usize = 32;
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct EqSpec {
+    /// PipeWire `node.name` of the filter. Same name in two profiles = same filter, so switching
+    /// profiles only retunes it instead of rebuilding it.
+    pub name: String,
+    #[serde(default)]
+    pub channels: Channels,
+    /// Gain applied before the bands, to make room for boosts.
+    #[serde(default)]
+    pub preamp_db: f32,
+    #[serde(default)]
+    pub bands: Vec<Band>,
+}
+
+impl EqSpec {
+    pub fn new(name: &str, channels: Channels) -> Self {
+        EqSpec { name: name.into(), channels, preamp_db: 0.0, bands: vec![] }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type")]
 pub enum NodeKind {
@@ -60,18 +129,52 @@ pub enum NodeKind {
     Output { device: Option<DeviceRef> },
     /// A virtual device owned by this profile.
     Bus(BusSpec),
-    /// Stands in for every hardware capture device that has no Input node.
-    FallbackInput,
-    /// Stands in for every hardware playback device that has no Output node.
-    FallbackOutput,
+    /// A native equalizer: audio goes in, gets EQ'd, comes out.
+    Eq(EqSpec),
+    /// One program's audio. Its out is what it plays; its in is what it records.
+    App { app: Option<AppRef> },
+    /// Every program without its own App node: what they play comes out here.
+    /// Wiring it to a device makes that device the system default output.
+    OtherAppsPlayback,
+    /// Every program without its own App node records from what's wired in here.
+    /// Wiring a device to it makes that device the system default input.
+    OtherAppsRecording,
+    /// Sends audio to the first of its numbered outputs whose device is plugged in.
+    FirstOutput { slots: u32 },
+    /// Passes on the first of its numbered inputs whose device is plugged in.
+    FirstInput { slots: u32 },
+}
+
+/// A program, matched by its executable name (stable across restarts).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AppRef {
+    /// `application.process.binary`, e.g. `DiscordCanary`.
+    pub binary: String,
+    /// `application.name` as last seen, for display.
+    #[serde(default)]
+    pub name: String,
 }
 
 impl NodeKind {
-    pub fn has_input(&self) -> bool {
-        matches!(self, NodeKind::Output { .. } | NodeKind::Bus(_) | NodeKind::FallbackOutput)
+    pub fn inputs(&self) -> usize {
+        match self {
+            NodeKind::Output { .. } | NodeKind::Bus(_) | NodeKind::Eq(_) | NodeKind::App { .. } => 1,
+            NodeKind::OtherAppsRecording | NodeKind::FirstOutput { .. } => 1,
+            NodeKind::FirstInput { slots } => *slots as usize,
+            NodeKind::Input { .. } | NodeKind::OtherAppsPlayback => 0,
+        }
     }
-    pub fn has_output(&self) -> bool {
-        matches!(self, NodeKind::Input { .. } | NodeKind::Bus(_) | NodeKind::FallbackInput)
+    pub fn outputs(&self) -> usize {
+        match self {
+            NodeKind::Input { .. } | NodeKind::Bus(_) | NodeKind::Eq(_) | NodeKind::App { .. } => 1,
+            NodeKind::OtherAppsPlayback | NodeKind::FirstInput { .. } => 1,
+            NodeKind::FirstOutput { slots } => *slots as usize,
+            NodeKind::Output { .. } | NodeKind::OtherAppsRecording => 0,
+        }
+    }
+    /// Routing-only nodes that stand for no PipeWire object of their own.
+    pub fn is_switch(&self) -> bool {
+        matches!(self, NodeKind::FirstOutput { .. } | NodeKind::FirstInput { .. })
     }
 }
 
@@ -83,11 +186,26 @@ pub struct GraphNode {
     pub kind: NodeKind,
 }
 
+fn is_zero(v: &u32) -> bool {
+    *v == 0
+}
+
 /// Audio flows from node `from` to node `to`. Channels are matched automatically.
+/// Pins only matter for "first available" nodes, which have numbered pins.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct Wire {
     pub from: u32,
     pub to: u32,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub from_pin: u32,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub to_pin: u32,
+}
+
+impl Wire {
+    pub fn new(from: u32, to: u32) -> Wire {
+        Wire { from, to, from_pin: 0, to_pin: 0 }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
@@ -223,9 +341,25 @@ mod tests {
                         }),
                     },
                 },
-                GraphNode { id: 3, pos: [0.0, 50.0], kind: NodeKind::FallbackInput },
+                GraphNode { id: 3, pos: [0.0, 50.0], kind: NodeKind::OtherAppsPlayback },
+                GraphNode { id: 5, pos: [0.0, 90.0], kind: NodeKind::FirstOutput { slots: 3 } },
+                GraphNode {
+                    id: 6,
+                    pos: [0.0, 90.0],
+                    kind: NodeKind::App { app: Some(AppRef { binary: "DiscordCanary".into(), name: "Discord".into() }) },
+                },
+                GraphNode {
+                    id: 4,
+                    pos: [50.0, 50.0],
+                    kind: NodeKind::Eq(EqSpec {
+                        name: "eq-mic".into(),
+                        channels: Channels::Mono,
+                        preamp_db: -3.0,
+                        bands: vec![Band { kind: BandKind::Bell, freq: 143.3, gain_db: 14.5, q: 4.0, enabled: true }],
+                    }),
+                },
             ],
-            wires: vec![Wire { from: 1, to: 2 }],
+            wires: vec![Wire::new(1, 2), Wire { from: 5, to: 2, from_pin: 1, to_pin: 0 }],
         };
         let text = toml::to_string_pretty(&p).unwrap();
         let back: Profile = toml::from_str(&text).unwrap();
