@@ -1,0 +1,127 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1280" height="320" viewBox="0 0 1280 320" role="img" aria-label="Better Sound Patching: node-based audio routing for PipeWire">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#0d1117"/>
+      <stop offset="1" stop-color="#141b24"/>
+    </linearGradient>
+    <pattern id="dots" width="24" height="24" patternUnits="userSpaceOnUse">
+      <circle cx="2" cy="2" r="1.1" fill="#ffffff" fill-opacity="0.05"/>
+    </pattern>
+    <linearGradient id="fade" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0" stop-color="#0d1117" stop-opacity="1"/>
+      <stop offset="0.45" stop-color="#0d1117" stop-opacity="0.85"/>
+      <stop offset="1" stop-color="#0d1117" stop-opacity="0"/>
+    </linearGradient>
+    <linearGradient id="meter" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0" stop-color="#50c878"/>
+      <stop offset="0.75" stop-color="#50c878"/>
+      <stop offset="0.9" stop-color="#e6aa3c"/>
+    </linearGradient>
+    <filter id="shadow" x="-10%" y="-10%" width="120%" height="140%">
+      <feDropShadow dx="0" dy="4" stdDeviation="6" flood-color="#000" flood-opacity="0.45"/>
+    </filter>
+    <style>
+      .t { font-family: Inter, "Segoe UI", Ubuntu, Cantarell, "Noto Sans", Helvetica, Arial, sans-serif; }
+      .node { fill: #1b1f26; stroke: #2c333d; stroke-width: 1; }
+      .head { fill: #232932; }
+      .title { fill: #c9d1d9; font-size: 12px; }
+      .lbl { fill: #8b949e; font-size: 11px; }
+      .wire { fill: none; stroke: #50c878; stroke-width: 2.4; stroke-linecap: round; }
+      .wire.off { stroke: #4a525c; stroke-width: 1.8; }
+      .pin { fill: #50c878; }
+      .pin.off { fill: #5b636d; }
+    </style>
+  </defs>
+
+  <rect width="1280" height="320" fill="url(#bg)"/>
+  <rect width="1280" height="320" fill="url(#dots)"/>
+
+  <!-- A small patch graph on the right -->
+  <g class="t" filter="url(#shadow)">
+    <!-- wires (drawn first, under nodes) -->
+    <path class="wire" d="M 688 96 C 740 96, 740 150, 792 150"/>
+    <path class="wire" d="M 688 214 C 740 214, 740 160, 792 160"/>
+    <path class="wire" d="M 942 150 C 975 150, 975 150, 1006 150"/>
+    <path class="wire" d="M 1150 132 C 1180 132, 1180 70, 1210 70"/>
+    <path class="wire off" d="M 1150 156 C 1180 156, 1180 240, 1210 240"/>
+
+    <!-- Apps -->
+    <rect class="node" x="548" y="66" width="140" height="56" rx="7"/>
+    <rect class="head" x="548" y="66" width="140" height="22" rx="7"/>
+    <rect class="head" x="548" y="80" width="140" height="8"/>
+    <text class="title" x="562" y="82">App · Game</text>
+    <text class="lbl" x="562" y="110">playing</text>
+    <circle class="pin" cx="688" cy="96" r="5"/>
+
+    <rect class="node" x="548" y="184" width="140" height="56" rx="7"/>
+    <rect class="head" x="548" y="184" width="140" height="22" rx="7"/>
+    <rect class="head" x="548" y="198" width="140" height="8"/>
+    <text class="title" x="562" y="200">App · Discord</text>
+    <text class="lbl" x="562" y="228">voice chat</text>
+    <circle class="pin" cx="688" cy="214" r="5"/>
+
+    <!-- EQ with a curve -->
+    <rect class="node" x="792" y="110" width="150" height="104" rx="7"/>
+    <rect class="head" x="792" y="110" width="150" height="22" rx="7"/>
+    <rect class="head" x="792" y="124" width="150" height="8"/>
+    <text class="title" x="806" y="126">EQ · headphones</text>
+    <rect x="804" y="140" width="126" height="60" rx="4" fill="#111418"/>
+    <line x1="804" y1="170" x2="930" y2="170" stroke="#2c333d" stroke-width="1"/>
+    <path d="M 806 178 C 822 186, 832 186, 842 170 S 852 140, 860 168 S 890 160, 900 156 S 920 150, 928 160" fill="none" stroke="#78c8ff" stroke-width="2"/>
+    <circle cx="830" cy="182" r="3.2" fill="#f0b446"/>
+    <circle cx="852" cy="146" r="3.2" fill="#6ebefa"/>
+    <circle cx="898" cy="157" r="3.2" fill="#e66ea0"/>
+    <circle class="pin" cx="792" cy="155" r="5"/>
+    <circle class="pin" cx="942" cy="150" r="5"/>
+
+    <!-- Switch -->
+    <rect class="node" x="1006" y="104" width="144" height="74" rx="7"/>
+    <rect class="head" x="1006" y="104" width="144" height="22" rx="7"/>
+    <rect class="head" x="1006" y="118" width="144" height="8"/>
+    <text class="title" x="1020" y="120">Output switch</text>
+    <text x="1136" y="136" text-anchor="end" font-size="11" fill="#50c878">1 Headset</text>
+    <text x="1136" y="160" text-anchor="end" font-size="11" fill="#8b949e">2 Speakers</text>
+    <circle class="pin" cx="1006" cy="150" r="5"/>
+    <circle class="pin" cx="1150" cy="132" r="5"/>
+    <circle class="pin off" cx="1150" cy="156" r="5"/>
+
+    <!-- Outputs -->
+    <rect class="node" x="1210" y="44" width="120" height="52" rx="7"/>
+    <rect class="head" x="1210" y="44" width="120" height="22" rx="7"/>
+    <rect class="head" x="1210" y="58" width="120" height="8"/>
+    <text class="title" x="1224" y="60">Headset</text>
+    <rect x="1222" y="76" width="44" height="6" rx="2" fill="url(#meter)"/>
+    <circle class="pin" cx="1210" cy="70" r="5"/>
+
+    <rect class="node" x="1210" y="214" width="120" height="52" rx="7"/>
+    <rect class="head" x="1210" y="214" width="120" height="22" rx="7"/>
+    <rect class="head" x="1210" y="228" width="120" height="8"/>
+    <text class="title" x="1224" y="230">Speakers</text>
+    <text class="lbl" x="1224" y="256">silent</text>
+    <circle class="pin off" cx="1210" cy="240" r="5"/>
+  </g>
+
+  <!-- Readability fade behind the text -->
+  <rect width="760" height="320" fill="url(#fade)"/>
+
+  <!-- Text -->
+  <g class="t">
+    <rect x="64" y="72" width="44" height="44" rx="11" fill="#50c878" fill-opacity="0.12" stroke="#50c878" stroke-opacity="0.5"/>
+    <path d="M 74 100 C 82 100, 82 84, 90 84 S 98 100, 98 100" fill="none" stroke="#50c878" stroke-width="2.6" stroke-linecap="round"/>
+    <circle cx="74" cy="100" r="3" fill="#50c878"/>
+    <circle cx="98" cy="100" r="3" fill="#50c878"/>
+    <text x="124" y="106" font-size="40" font-weight="700" fill="#e6edf3" letter-spacing="-0.5">Better Sound Patching</text>
+    <text x="64" y="158" font-size="20" fill="#9da7b3">Node-based audio routing for PipeWire.</text>
+    <text x="64" y="186" font-size="20" fill="#9da7b3">Set it up once, switch with one key.</text>
+    <g font-size="13" font-weight="600">
+      <rect x="64" y="222" width="62" height="28" rx="14" fill="#1f2630" stroke="#2f3843"/>
+      <text x="95" y="241" text-anchor="middle" fill="#dea584">Rust</text>
+      <rect x="136" y="222" width="94" height="28" rx="14" fill="#1f2630" stroke="#2f3843"/>
+      <text x="183" y="241" text-anchor="middle" fill="#78c8ff">PipeWire</text>
+      <rect x="240" y="222" width="104" height="28" rx="14" fill="#1f2630" stroke="#2f3843"/>
+      <text x="292" y="241" text-anchor="middle" fill="#c9d1d9">Native GUI</text>
+      <rect x="354" y="222" width="72" height="28" rx="14" fill="#1f2630" stroke="#2f3843"/>
+      <text x="390" y="241" text-anchor="middle" fill="#c9d1d9">Linux</text>
+    </g>
+  </g>
+</svg>

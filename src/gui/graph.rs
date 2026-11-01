@@ -65,6 +65,8 @@ pub struct Viewer<'a> {
     pub running: bool,
     /// A switch pin the user clicked this frame: (switch name, pin).
     pub select: Option<(String, u32)>,
+    /// Set to the graph area to zoom and pan so every node fits in it (once).
+    pub fit_to: Option<Rect>,
     /// What the "Other apps" nodes made the default output / input (live ids).
     pub defaults: (Option<u32>, Option<u32>),
     /// Your names for devices (node.name -> label), edited in place.
@@ -268,7 +270,41 @@ impl Viewer<'_> {
     }
 }
 
+/// Roughly how much room a node takes on screen at 100% zoom (the library doesn't expose sizes).
+fn approx_size(kind: &NodeKind) -> egui::Vec2 {
+    match kind {
+        NodeKind::Eq(_) => vec2(340.0, 340.0),
+        NodeKind::Levels(_) => vec2(320.0, 160.0),
+        NodeKind::Volume(_) => vec2(320.0, 110.0),
+        NodeKind::SwitchOutput { pins, .. } | NodeKind::SwitchInput { pins, .. } => vec2(360.0, 110.0 + 26.0 * pins.len() as f32),
+        _ => vec2(290.0, 120.0),
+    }
+}
+
+/// The zoom and pan that show every node inside `area`.
+fn fit_transform(snarl: &Snarl<NodeKind>, area: Rect) -> Option<egui::emath::TSTransform> {
+    let mut bb = Rect::NOTHING;
+    for (_, pos, kind) in snarl.nodes_pos_ids() {
+        bb.extend_with(pos);
+        bb.extend_with(pos + approx_size(kind));
+    }
+    if !bb.is_finite() || !area.is_finite() {
+        return None;
+    }
+    let bb = bb.expand(30.0);
+    let scaling = (area.size() / bb.size()).min_elem().clamp(0.2, 1.5);
+    Some(egui::emath::TSTransform::new(area.center().to_vec2() - bb.center().to_vec2() * scaling, scaling))
+}
+
 impl SnarlViewer<NodeKind> for Viewer<'_> {
+    fn current_transform(&mut self, to_global: &mut egui::emath::TSTransform, snarl: &mut Snarl<NodeKind>) {
+        if let Some(area) = self.fit_to.take()
+            && let Some(t) = fit_transform(snarl, area)
+        {
+            *to_global = t;
+        }
+    }
+
     fn title(&mut self, node: &NodeKind) -> String {
         let named = |kind: &str, d: &Option<DeviceRef>| match d {
             Some(d) => format!("{kind} · {}", display_name(self.labels, &d.node_name, &d.description)),

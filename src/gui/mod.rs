@@ -21,10 +21,21 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+/// `BSP_SCREENSHOT_SIZE=2100x1290` opens the window at that size (for docs screenshots).
+fn window_size() -> [f32; 2] {
+    std::env::var("BSP_SCREENSHOT_SIZE")
+        .ok()
+        .and_then(|s| {
+            let (w, h) = s.split_once('x')?;
+            Some([w.parse().ok()?, h.parse().ok()?])
+        })
+        .unwrap_or([1400.0, 860.0])
+}
+
 pub fn run() -> Result<()> {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_inner_size([1400.0, 860.0])
+            .with_inner_size(window_size())
             .with_title("Better Sound Patching")
             .with_app_id("better-sound-patching"),
         ..Default::default()
@@ -64,12 +75,14 @@ struct App {
     /// Signal levels of processing nodes, refreshed ~25 times a second while any are shown.
     readings: Arc<Mutex<BTreeMap<String, Reading>>>,
     want_levels: Arc<AtomicBool>,
+    /// Zoom the graph to show every node on the next frame.
+    fit_pending: bool,
     snarl: Snarl<NodeKind>,
     style: SnarlStyle,
     dialog: Option<Dialog>,
     dragging: HashMap<u32, (f32, Instant)>,
     labels: model::Labels,
-    /// Last unsaved version of the active profile sent to the daemon for live preview.
+    /// Last unsaved version of the graph sent to the daemon for live preview.
     preview_sent: Option<Graph>,
     preview_at: Instant,
     /// The daemon is currently playing unsaved edits.
@@ -209,6 +222,7 @@ impl App {
             selected_at: None,
             readings,
             want_levels,
+            fit_pending: true,
             snarl: Snarl::new(),
             style,
             dialog: None,
@@ -226,6 +240,7 @@ impl App {
     /// Load the saved graph, or a starter graph (unsaved) if there is none yet.
     fn open_graph(&mut self) {
         self.drop_preview();
+        self.fit_pending = true;
         if !model::graph_exists() {
             self.snarl = graph::to_snarl(&starter_graph());
             self.saved = Graph::default();
@@ -376,6 +391,10 @@ impl App {
             {
                 self.open_graph();
             }
+            ui.separator();
+            if ui.button("Fit view").on_hover_text("Zoom to show the whole graph").clicked() {
+                self.fit_pending = true;
+            }
         });
     }
 
@@ -476,7 +495,7 @@ impl App {
         let vols = self.volumes.lock().unwrap().clone();
 
         if strips.is_empty() {
-            ui.label(RichText::new("No virtual devices in this profile are running yet.").weak());
+            ui.label(RichText::new("No virtual devices are running yet.").weak());
         }
         for (id, name, icon) in &strips {
             self.strip(ui, *id, &format!("{icon} {name}"), &vols);
@@ -674,6 +693,7 @@ impl eframe::App for App {
                 readings: &readings,
                 running: info.status.is_some(),
                 select: None,
+                fit_to: std::mem::take(&mut self.fit_pending).then(|| ui.max_rect()),
                 defaults: (plan.default_sink, plan.default_source),
                 labels: &mut self.labels,
                 labels_changed: false,
@@ -709,7 +729,8 @@ impl eframe::App for App {
 fn debug_screenshot(ctx: &egui::Context) {
     let Some(path) = std::env::var_os("BSP_SCREENSHOT") else { return };
     let frame = ctx.cumulative_frame_nr();
-    if frame == 40 {
+    let at: u64 = std::env::var("BSP_SCREENSHOT_FRAME").ok().and_then(|f| f.parse().ok()).unwrap_or(40);
+    if frame == at {
         ctx.send_viewport_cmd(egui::ViewportCommand::Screenshot(Default::default()));
     }
     let shot = ctx.input(|i| {
