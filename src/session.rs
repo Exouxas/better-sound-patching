@@ -1,0 +1,393 @@
+//! Trial sessions, approval and revert.
+//!
+//! The rule: nothing persistent changes until you approve. A trial only pauses programs for
+//! this login session and keeps a record so they can be relaunched; rebooting always gives you
+//! your old setup back. Approval is reversible with `revert`.
+
+use crate::engine::{self, Cmd, EngineConfig};
+use crate::ipc::{self, Request, Response};
+use crate::model;
+use anyhow::{Context, Result, bail};
+use serde::{Deserialize, Serialize};
+use std::io::{BufRead, BufReader, Write};
+use std::os::unix::net::UnixListener;
+use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
+use std::time::{Duration, Instant};
+
+/// Programs that also manage routing and would fight with us.
+pub const KNOWN_CONFLICTS: &[(&str, &str)] = &[
+    ("qpwgraph", "Its exclusive patchbay re-draws its own links and removes ours."),
+    ("easyeffects", "Its effect chains link themselves to devices. Pause it unless your profile routes through it."),
+];
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PausedApp {
+    pub name: String,
+    /// Command used to bring it back (taken from its autostart entry when there is one).
+    pub relaunch: Vec<String>,
+}
+
+fn runtime_dir() -> PathBuf {
+    std::env::var_os("XDG_RUNTIME_DIR").map(PathBuf::from).unwrap_or_else(std::env::temp_dir)
+}
+
+fn paused_record() -> PathBuf {
+    runtime_dir().join("better-sound-patching-paused.json")
+}
+
+pub fn pids_of(process: &str) -> Vec<(u32, Vec<String>)> {
+    let me = std::process::id();
+    std::fs::read_dir("/proc")
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter_map(|e| {
+            let pid: u32 = e.file_name().to_str()?.parse().ok()?;
+            if pid == me {
+                return None;
+            }
+            let comm = std::fs::read_to_string(e.path().join("comm")).ok()?;
+            if comm.trim() != process {
+                return None;
+            }
+            let cmdline = std::fs::read(e.path().join("cmdline")).ok()?;
+            let args = cmdline
+                .split(|b| *b == 0)
+                .filter(|s| !s.is_empty())
+                .map(|s| String::from_utf8_lossy(s).into_owned())
+                .collect();
+            Some((pid, args))
+        })
+        .collect()
+}
+
+pub fn is_running(process: &str) -> bool {
+    !pids_of(process).is_empty()
+}
+
+fn autostart_dir() -> PathBuf {
+    dirs::config_dir().unwrap_or_default().join("autostart")
+}
+
+fn disabled_autostart_dir() -> PathBuf {
+    model::config_dir().join("disabled-autostart")
+}
+
+fn desktop_exec(path: &Path) -> Option<Vec<String>> {
+    let text = std::fs::read_to_string(path).ok()?;
+    let mut in_entry = false;
+    for line in text.lines() {
+        let line = line.trim();
+        if line.starts_with('[') {
+            in_entry = line == "[Desktop Entry]";
+        } else if in_entry && let Some(exec) = line.strip_prefix("Exec=") {
+            return Some(
+                exec.split_whitespace()
+                    .filter(|a| !(a.len() == 2 && a.starts_with('%')))
+                    .map(str::to_owned)
+                    .collect(),
+            );
+        }
+    }
+    None
+}
+
+/// The autostart `.desktop` file that launches `process`, if any.
+pub fn autostart_entry(process: &str, dir: &Path) -> Option<(PathBuf, Vec<String>)> {
+    std::fs::read_dir(dir).ok()?.flatten().find_map(|e| {
+        let path = e.path();
+        if path.extension()? != "desktop" {
+            return None;
+        }
+        let exec = desktop_exec(&path)?;
+        let bin = Path::new(exec.first()?).file_name()?.to_str()?;
+        (bin == process).then_some((path, exec))
+    })
+}
+
+fn stop_process(process: &str) {
+    for (pid, _) in pids_of(process) {
+        let _ = Command::new("kill").arg(pid.to_string()).status();
+    }
+    let deadline = Instant::now() + Duration::from_secs(4);
+    while is_running(process) && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    for (pid, _) in pids_of(process) {
+        let _ = Command::new("kill").args(["-9", &pid.to_string()]).status();
+    }
+}
+
+fn launch_detached(cmd: &[String]) -> Result<()> {
+    let Some((bin, args)) = cmd.split_first() else { bail!("empty command") };
+    Command::new("setsid")
+        .arg("-f")
+        .arg(bin)
+        .args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .with_context(|| format!("launching {bin}"))?;
+    Ok(())
+}
+
+pub fn pause_apps(names: &[String]) -> Vec<PausedApp> {
+    let mut paused = Vec::new();
+    for name in names {
+        let running = pids_of(name);
+        if running.is_empty() {
+            continue;
+        }
+        let relaunch = autostart_entry(name, &autostart_dir())
+            .map(|(_, exec)| exec)
+            .unwrap_or_else(|| running[0].1.clone());
+        log::info!("pausing {name} for this session (will relaunch with {relaunch:?})");
+        stop_process(name);
+        paused.push(PausedApp { name: name.clone(), relaunch });
+    }
+    if !paused.is_empty()
+        && let Ok(json) = serde_json::to_string_pretty(&paused)
+    {
+        let _ = std::fs::write(paused_record(), json);
+    }
+    paused
+}
+
+/// Relaunch everything a trial paused. Also works after a daemon crash.
+pub fn restore_paused() -> Result<Vec<String>> {
+    let Ok(text) = std::fs::read_to_string(paused_record()) else { return Ok(vec![]) };
+    let paused: Vec<PausedApp> = serde_json::from_str(&text).unwrap_or_default();
+    let mut restored = vec![];
+    for app in paused {
+        if is_running(&app.name) {
+            continue;
+        }
+        log::info!("relaunching {}", app.name);
+        launch_detached(&app.relaunch)?;
+        restored.push(app.name);
+    }
+    let _ = std::fs::remove_file(paused_record());
+    Ok(restored)
+}
+
+pub fn paused_pending() -> Vec<PausedApp> {
+    std::fs::read_to_string(paused_record())
+        .ok()
+        .and_then(|t| serde_json::from_str(&t).ok())
+        .unwrap_or_default()
+}
+
+/// Run the routing daemon in the foreground.
+pub fn run_daemon(pause: &[String]) -> Result<()> {
+    if ipc::status().is_some() {
+        bail!("a daemon is already running");
+    }
+    let sock = ipc::socket_path();
+    let _ = std::fs::remove_file(&sock);
+    let listener = UnixListener::bind(&sock).with_context(|| format!("binding {}", sock.display()))?;
+
+    let paused = pause_apps(pause);
+    let (tx, rx) = pipewire::channel::channel::<Cmd>();
+
+    std::thread::spawn(move || {
+        for conn in listener.incoming().flatten() {
+            let tx = tx.clone();
+            std::thread::spawn(move || {
+                let mut line = String::new();
+                let mut reader = BufReader::new(&conn);
+                if reader.read_line(&mut line).is_err() {
+                    return;
+                }
+                let resp = match serde_json::from_str::<Request>(&line) {
+                    Ok(req) => {
+                        let (rtx, rrx) = std::sync::mpsc::channel();
+                        if tx.send(Cmd::Ipc(req, rtx)).is_err() {
+                            return;
+                        }
+                        rrx.recv_timeout(Duration::from_secs(4))
+                            .unwrap_or_else(|_| Response::Error("daemon busy".into()))
+                    }
+                    Err(e) => Response::Error(format!("bad request: {e}")),
+                };
+                if let Ok(mut s) = serde_json::to_string(&resp) {
+                    s.push('\n');
+                    let _ = (&conn).write_all(s.as_bytes());
+                }
+            });
+        }
+    });
+
+    let result = engine::run(
+        EngineConfig {
+            enforce: true,
+            on_snapshot: Box::new(|_| {}),
+            paused: paused.iter().map(|p| p.name.clone()).collect(),
+        },
+        rx,
+    );
+    let _ = std::fs::remove_file(&sock);
+
+    let restore = match &result {
+        Ok(info) => info.restore_paused,
+        Err(_) => true,
+    };
+    if restore {
+        match restore_paused() {
+            Ok(names) if !names.is_empty() => log::info!("restored {}", names.join(", ")),
+            Err(e) => log::error!("restoring paused programs: {e:#}"),
+            _ => {}
+        }
+    }
+    result.map(|_| ())
+}
+
+/// Start a trial daemon in the background, detached from the GUI.
+pub fn start_trial(pause: &[String]) -> Result<()> {
+    let exe = std::env::current_exe()?;
+    let log = runtime_dir().join("better-sound-patching.log");
+    let mut cmd = Command::new("setsid");
+    cmd.arg("-f").arg(exe).arg("daemon");
+    for p in pause {
+        cmd.arg("--pause").arg(p);
+    }
+    let logf = std::fs::File::create(&log)?;
+    cmd.stdin(Stdio::null()).stdout(logf.try_clone()?).stderr(logf);
+    cmd.status().context("starting daemon")?;
+    // Wait for the socket so the caller can talk to it immediately.
+    let deadline = Instant::now() + Duration::from_secs(8);
+    while Instant::now() < deadline {
+        if ipc::status().is_some() {
+            return Ok(());
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    bail!("daemon did not start; see {}", log.display())
+}
+
+pub fn stop_daemon(restore: bool) -> Result<()> {
+    match ipc::request(&Request::Stop { restore_paused: restore })? {
+        Response::Error(e) => bail!(e),
+        _ => {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while ipc::socket_path().exists() && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            Ok(())
+        }
+    }
+}
+
+// ---------------------------------------------------------------- approval
+
+const UNIT: &str = "better-sound-patching.service";
+
+fn unit_path() -> PathBuf {
+    dirs::config_dir().unwrap_or_default().join("systemd/user").join(UNIT)
+}
+
+fn installed_bin() -> PathBuf {
+    dirs::home_dir().unwrap_or_default().join(".local/bin/bsp")
+}
+
+pub fn is_approved() -> bool {
+    unit_path().exists()
+}
+
+fn systemctl(args: &[&str]) -> Result<()> {
+    let st = Command::new("systemctl").arg("--user").args(args).status()?;
+    if !st.success() {
+        bail!("systemctl --user {} failed", args.join(" "));
+    }
+    Ok(())
+}
+
+/// Make the new system permanent: install the binary and a user service that starts at
+/// login, and stop the given programs from autostarting (their entries are moved aside, not
+/// deleted, so `revert` can put them back).
+pub fn approve(disable: &[String]) -> Result<()> {
+    if model::load_state().active_profile.is_none() {
+        bail!("no active profile yet; switch to one and try it first");
+    }
+    let bin = installed_bin();
+    std::fs::create_dir_all(bin.parent().unwrap())?;
+    let tmp = bin.with_extension("new");
+    std::fs::copy(std::env::current_exe()?, &tmp)?;
+    std::fs::rename(&tmp, &bin)?;
+
+    if ipc::status().is_some() {
+        stop_daemon(false)?;
+    }
+    let _ = std::fs::remove_file(paused_record());
+
+    std::fs::create_dir_all(disabled_autostart_dir())?;
+    for name in disable {
+        if let Some((path, _)) = autostart_entry(name, &autostart_dir()) {
+            let dest = disabled_autostart_dir().join(path.file_name().unwrap());
+            std::fs::rename(&path, &dest)?;
+            println!("autostart for {name} moved to {}", dest.display());
+        }
+        stop_process(name);
+    }
+
+    let unit = format!(
+        "[Unit]\n\
+         Description=Better Sound Patching routing daemon\n\
+         After=pipewire.service wireplumber.service\n\
+         Requires=pipewire.service\n\
+         \n\
+         [Service]\n\
+         ExecStart={bin} daemon\n\
+         Restart=on-failure\n\
+         RestartSec=2\n\
+         \n\
+         [Install]\n\
+         WantedBy=default.target\n",
+        bin = bin.display()
+    );
+    std::fs::create_dir_all(unit_path().parent().unwrap())?;
+    model::write_atomic(&unit_path(), &unit)?;
+    systemctl(&["daemon-reload"])?;
+    systemctl(&["enable", "--now", UNIT])?;
+    install_desktop_entry(&bin)?;
+    Ok(())
+}
+
+/// Undo `approve`: remove the service and restore the moved autostart entries.
+pub fn revert() -> Result<()> {
+    if unit_path().exists() {
+        let _ = systemctl(&["disable", "--now", UNIT]);
+        std::fs::remove_file(unit_path())?;
+        systemctl(&["daemon-reload"])?;
+    } else if ipc::status().is_some() {
+        stop_daemon(true)?;
+    }
+    for e in std::fs::read_dir(disabled_autostart_dir()).into_iter().flatten().flatten() {
+        let path = e.path();
+        let dest = autostart_dir().join(path.file_name().unwrap());
+        std::fs::create_dir_all(autostart_dir())?;
+        std::fs::rename(&path, &dest)?;
+        if let Some(exec) = desktop_exec(&dest) {
+            let name = Path::new(&exec[0]).file_name().and_then(|s| s.to_str()).unwrap_or_default();
+            if !is_running(name) {
+                launch_detached(&exec)?;
+            }
+        }
+        println!("restored autostart {}", dest.display());
+    }
+    restore_paused()?;
+    Ok(())
+}
+
+fn install_desktop_entry(bin: &Path) -> Result<()> {
+    let dir = dirs::data_dir().unwrap_or_default().join("applications");
+    std::fs::create_dir_all(&dir)?;
+    let entry = format!(
+        "[Desktop Entry]\nType=Application\nName=Better Sound Patching\n\
+         Comment=Audio routing and mixer\nExec={} gui\nIcon=audio-card\n\
+         Categories=AudioVideo;Audio;Mixer;\n",
+        bin.display()
+    );
+    model::write_atomic(&dir.join("better-sound-patching.desktop"), &entry)
+}
