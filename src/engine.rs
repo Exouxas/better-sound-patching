@@ -1,13 +1,13 @@
 //! The PipeWire side: mirrors the registry into a [`Live`] snapshot and, in enforce mode,
-//! makes the graph match the active profile.
+//! makes PipeWire match the routing graph.
 //!
 //! Everything we create uses `object.linger = false`, so it belongs to this process:
 //! if the daemon stops or crashes, its links and virtual devices vanish with it.
 
 use crate::ipc::{Request, Response, Status};
 use crate::live::{Dir, Live, LiveLink, LiveNode, LivePort};
-use crate::eqnode::EqNode;
-use crate::model::{self, BusKind, BusSpec, Profile};
+use crate::filter::FilterNode;
+use crate::model::{self, BusKind, BusSpec, Graph, Selections};
 use crate::planner::{self, PortPair};
 use anyhow::{Result, anyhow};
 use pipewire as pw;
@@ -22,13 +22,31 @@ pub enum Cmd {
     Ipc(Request, mpsc::Sender<Response>),
 }
 
+/// Select every switch pin bound to `key`. Returns how many switches changed.
+pub fn press_key(graph: &Graph, selected: &mut Selections, key: &str) -> usize {
+    let mut changed = 0;
+    for n in &graph.nodes {
+        let Some((name, pins)) = n.kind.switch() else { continue };
+        if let Some(k) = pins.iter().position(|p| !p.key.is_empty() && p.key.eq_ignore_ascii_case(key)) {
+            let k = k as u32;
+            if crate::planner::selected_pin(&n.kind, selected) != Some(k) {
+                changed += 1;
+            }
+            selected.insert(name.to_owned(), k);
+        }
+    }
+    changed
+}
+
 pub struct EngineConfig {
-    /// Apply the active profile. When false, only observe.
+    /// Apply the routing graph. When false, only observe.
     pub enforce: bool,
     /// Called on the PipeWire thread whenever the live graph changed.
     pub on_snapshot: Box<dyn Fn(&Live)>,
     /// Shown in status: programs paused for this session.
     pub paused: Vec<String>,
+    /// Told the set of switch shortcut keys whenever it changes.
+    pub hotkeys: Option<mpsc::Sender<BTreeSet<String>>>,
 }
 
 pub struct ExitInfo {
@@ -50,11 +68,11 @@ struct OwnedBus {
 struct State {
     live: Live,
     dirty: bool,
-    profile_name: Option<String>,
-    profile: Option<Profile>,
+    profile: Option<Graph>,
+    selected: Selections,
     links: HashMap<PortPair, OwnedLink>,
     buses: HashMap<String, OwnedBus>,
-    eqs: HashMap<String, EqNode>,
+    filters: HashMap<String, FilterNode>,
     /// App streams we route ourselves. When we let go, they get linked back to the default.
     taken: BTreeSet<u32>,
     /// Clients we've bound to read their full properties (the executable name isn't in the
@@ -71,6 +89,8 @@ struct State {
     last_error: Option<String>,
     restore_paused: bool,
     fatal: Option<String>,
+    hotkeys: Option<mpsc::Sender<BTreeSet<String>>>,
+    keys_sent: Option<BTreeSet<String>>,
 }
 
 fn parse_u32(props: &pw::spa::utils::dict::DictRef, key: &str) -> Option<u32> {
@@ -228,9 +248,20 @@ fn current_default(sink: bool) -> Option<u32> {
     String::from_utf8_lossy(&out.stdout).strip_prefix("id ")?.split(',').next()?.trim().parse().ok()
 }
 
+/// Testing aid: `BSP_TEST_KEEP_HARDWARE=1` makes a daemon that only ever touches its own
+/// throwaway virtual devices: links to real devices are left alone, streams are never handed to
+/// the default devices, and the defaults are never changed.
+fn test_mode() -> bool {
+    std::env::var_os("BSP_TEST_KEEP_HARDWARE").is_some()
+}
+
 /// Give app streams we stop routing back to the default device, the way WirePlumber would have
 /// linked them. These links outlive us (linger), so stopping the daemon never leaves an app mute.
 fn hand_back(st: &mut State, core: &pw::core::CoreRc, streams: &[u32]) {
+    // A test daemon must never send anything to the real default devices.
+    if test_mode() {
+        return;
+    }
     for &id in streams {
         let Some(node) = st.live.nodes.get(&id) else { continue };
         let playback = node.is_playback_stream();
@@ -254,6 +285,9 @@ fn hand_back(st: &mut State, core: &pw::core::CoreRc, streams: &[u32]) {
 /// The first time, remember what the default was so it can be put back when we stop.
 fn set_default(live: &Live, last: &mut Option<String>, original: &mut Option<u32>, id: Option<u32>, sink: bool) {
     let Some(node) = id.and_then(|id| live.nodes.get(&id)) else { return };
+    if test_mode() {
+        return;
+    }
     if last.as_deref() == Some(node.name.as_str()) {
         return;
     }
@@ -268,17 +302,29 @@ fn set_default(live: &Live, last: &mut Option<String>, original: &mut Option<u32
     });
 }
 
-/// Bring the live graph in line with the active profile.
+/// Bring PipeWire in line with the routing graph.
 fn reconcile(st: &mut State, core: &pw::core::CoreRc, registry: &pw::registry::RegistryRc) {
     let Some(profile) = st.profile.clone() else {
         st.links.clear();
         st.buses.clear();
-        st.eqs.clear();
+        st.filters.clear();
         let taken: Vec<u32> = std::mem::take(&mut st.taken).into_iter().collect();
         hand_back(st, core, &taken);
         return;
     };
-    let plan = planner::plan(&profile, &st.live);
+    let keys: BTreeSet<String> =
+        profile.nodes.iter().filter_map(|n| n.kind.switch()).flat_map(|s| s.1).filter(|p| !p.key.is_empty()).map(|p| p.key.clone()).collect();
+    if st.keys_sent.as_ref() != Some(&keys)
+        && let Some(tx) = &st.hotkeys
+    {
+        let _ = tx.send(keys.clone());
+        st.keys_sent = Some(keys);
+    }
+    let mut plan = planner::plan(&profile, &st.live, &st.selected);
+    if test_mode() {
+        let hw = |id: u32| st.live.nodes.get(&id).is_some_and(|n| n.is_hardware());
+        plan.remove.retain(|id| st.live.links.get(id).is_none_or(|l| !hw(l.out_node) && !hw(l.in_node)));
+    }
 
     // Drop our links the profile no longer wants first (before any bus they touch goes away).
     // Dropping an OwnedLink destroys the link in PipeWire.
@@ -313,19 +359,19 @@ fn reconcile(st: &mut State, core: &pw::core::CoreRc, registry: &pw::registry::R
         }
     }
 
-    // Equalizers: retune in place when possible (no gap in the audio), rebuild otherwise.
-    st.eqs.retain(|name, node| plan.eqs.iter().any(|e| &e.name == name && node.compatible(e)));
-    for spec in &plan.eqs {
-        if let Some(node) = st.eqs.get_mut(&spec.name) {
+    // Processing nodes: retune in place when possible (no gap in the audio), rebuild otherwise.
+    st.filters.retain(|name, node| plan.filters.iter().any(|f| f.name() == name && node.compatible(f)));
+    for spec in &plan.filters {
+        if let Some(node) = st.filters.get_mut(spec.name()) {
             node.update(spec);
             continue;
         }
-        match EqNode::new(core, spec) {
+        match FilterNode::new(core, spec) {
             Ok(node) => {
-                log::info!("started equalizer {}", spec.name);
-                st.eqs.insert(spec.name.clone(), node);
+                log::info!("started {}", spec.name());
+                st.filters.insert(spec.name().to_owned(), node);
             }
-            Err(e) => st.last_error = Some(format!("starting EQ {}: {e:#}", spec.name)),
+            Err(e) => st.last_error = Some(format!("starting {}: {e:#}", spec.name())),
         }
     }
 
@@ -378,13 +424,14 @@ fn status(st: &State, cfg_paused: &[String]) -> Status {
     let mut buses_owned: Vec<String> = st.buses.keys().cloned().collect();
     buses_owned.sort();
     Status {
-        active_profile: st.profile_name.clone(),
+        graph_loaded: st.profile.is_some(),
+        selected: st.selected.clone(),
         pid: std::process::id(),
         paused: cfg_paused.to_vec(),
         links_owned: st.links.len(),
         buses_owned,
-        eqs_running: {
-            let mut v: Vec<String> = st.eqs.keys().cloned().collect();
+        filters_running: {
+            let mut v: Vec<String> = st.filters.keys().cloned().collect();
             v.sort();
             v
         },
@@ -392,12 +439,19 @@ fn status(st: &State, cfg_paused: &[String]) -> Status {
     }
 }
 
-fn load_active(st: &mut State, name: &str) -> Result<()> {
-    let profile = model::load_profile(name)?;
-    st.profile = Some(profile);
-    st.profile_name = Some(name.to_owned());
+fn load_graph(st: &mut State) -> Result<()> {
+    st.profile = Some(model::load_graph()?);
     st.dirty = true;
     Ok(())
+}
+
+/// Remember selections across restarts.
+fn save_selected(st: &State) {
+    let mut state = model::load_state();
+    state.selected = st.selected.clone();
+    if let Err(e) = model::save_state(&state) {
+        log::warn!("saving selections: {e:#}");
+    }
 }
 
 /// Run the PipeWire loop on the current thread until quit.
@@ -408,16 +462,15 @@ pub fn run(cfg: EngineConfig, cmd_rx: pw::channel::Receiver<Cmd>) -> Result<Exit
     let core = context.connect_rc(None)?;
     let registry = core.get_registry_rc()?;
 
-    let state = Rc::new(RefCell::new(State { dirty: true, restore_paused: true, ..Default::default() }));
+    let state = Rc::new(RefCell::new(State { dirty: true, restore_paused: true, hotkeys: cfg.hotkeys.clone(), ..Default::default() }));
     if cfg.enforce {
         let mut st = state.borrow_mut();
-        if let Some(name) = model::load_state().active_profile {
-            if let Err(e) = load_active(&mut st, &name) {
-                log::error!("{e:#}");
-                st.last_error = Some(format!("{e:#}"));
-            }
-        } else {
-            log::warn!("no active profile; nothing will be routed until you switch to one");
+        st.selected = model::load_state().selected;
+        if !model::graph_exists() {
+            log::warn!("no routing graph yet; nothing will be routed until you save one");
+        } else if let Err(e) = load_graph(&mut st) {
+            log::error!("{e:#}");
+            st.last_error = Some(format!("{e:#}"));
         }
     }
 
@@ -486,22 +539,41 @@ pub fn run(cfg: EngineConfig, cmd_rx: pw::channel::Receiver<Cmd>) -> Result<Exit
                 Cmd::Ipc(req, tx) => {
                     let resp = match req {
                         Request::Status => Response::Status(status(&st, &paused)),
-                        Request::Reload => match st.profile_name.clone() {
-                            Some(name) => match load_active(&mut st, &name) {
-                                Ok(()) => Response::Ok,
-                                Err(e) => Response::Error(format!("{e:#}")),
-                            },
-                            None => Response::Ok,
-                        },
-                        Request::Switch { profile } if enforce => match load_active(&mut st, &profile) {
-                            Ok(()) => {
-                                log::info!("switched to profile {profile}");
-                                let _ = model::save_state(&model::AppState { active_profile: Some(profile) });
-                                Response::Ok
-                            }
+                        Request::Reload if enforce => match load_graph(&mut st) {
+                            Ok(()) => Response::Ok,
                             Err(e) => Response::Error(format!("{e:#}")),
                         },
-                        Request::Switch { .. } => Response::Error("not enforcing".into()),
+                        Request::Reload => Response::Ok,
+                        Request::Select { switch, pin } if enforce => {
+                            let exists = st.profile.as_ref().is_some_and(|g| {
+                                g.nodes.iter().any(|n| n.kind.switch().is_some_and(|(name, pins)| name == switch && (pin as usize) < pins.len()))
+                            });
+                            if exists {
+                                log::info!("{switch} -> pin {}", pin + 1);
+                                st.selected.insert(switch, pin);
+                                save_selected(&st);
+                                reconcile(&mut st, &core_for_cmd, &registry_for_cmd);
+                                Response::Ok
+                            } else {
+                                Response::Error(format!("no switch {switch:?} with a pin {}", pin + 1))
+                            }
+                        }
+                        Request::Key { key } if enforce => {
+                            let graph = st.profile.clone().unwrap_or_default();
+                            let mut selected = st.selected.clone();
+                            if graph.nodes.iter().filter_map(|n| n.kind.switch()).flat_map(|s| s.1).any(|p| p.key.eq_ignore_ascii_case(&key)) {
+                                let changed = press_key(&graph, &mut selected, &key);
+                                log::info!("key {key}: {changed} switch(es) changed");
+                                st.selected = selected;
+                                save_selected(&st);
+                                reconcile(&mut st, &core_for_cmd, &registry_for_cmd);
+                                Response::Ok
+                            } else {
+                                Response::Error(format!("no switch pin uses the key {key:?}"))
+                            }
+                        }
+                        Request::Select { .. } | Request::Key { .. } => Response::Error("not enforcing".into()),
+                        Request::Levels => Response::Levels(st.filters.iter().map(|(k, f)| (k.clone(), f.reading())).collect()),
                         Request::Preview { profile } if enforce => {
                             st.profile = Some(profile);
                             // Apply right away rather than on the next tick: this is what makes
@@ -597,7 +669,7 @@ pub fn run(cfg: EngineConfig, cmd_rx: pw::channel::Receiver<Cmd>) -> Result<Exit
     // Explicitly drop our objects while still connected so PipeWire removes them right away.
     let mut st = state.borrow_mut();
     st.links.clear();
-    st.eqs.clear();
+    st.filters.clear();
     st.buses.clear();
     drop(st);
     roundtrip(&mainloop, &core);

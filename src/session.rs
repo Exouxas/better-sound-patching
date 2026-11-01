@@ -18,16 +18,13 @@ use std::time::{Duration, Instant};
 /// Programs that also manage routing and would fight with us.
 pub const KNOWN_CONFLICTS: &[(&str, &str)] = &[
     ("qpwgraph", "Its exclusive patchbay re-draws its own links and removes ours."),
-    ("easyeffects", "Its effect chains link themselves to devices. Pause it unless your profile routes through it."),
+    ("easyeffects", "Its effect chains link themselves to devices. Pause it unless your graph routes through it."),
 ];
 
 /// Which conflicting programs to pause/disable by default: qpwgraph always, EasyEffects
-/// unless the active profile still routes through its devices.
+/// unless the graph still routes through its devices.
 pub fn default_conflicts() -> Vec<String> {
-    let uses_easyeffects = model::load_state()
-        .active_profile
-        .and_then(|p| model::load_profile(&p).ok())
-        .is_some_and(|p| {
+    let uses_easyeffects = model::load_graph().ok().is_some_and(|p| {
             p.nodes.iter().any(|n| match &n.kind {
                 model::NodeKind::Input { device: Some(d) } | model::NodeKind::Output { device: Some(d) } => {
                     d.node_name.starts_with("easyeffects")
@@ -257,6 +254,8 @@ pub fn run_daemon(pause: &[String]) -> Result<()> {
 
     let paused = pause_apps(pause);
     let (tx, rx) = pipewire::channel::channel::<Cmd>();
+    // Test daemons never grab global shortcuts.
+    let hotkeys = std::env::var_os("BSP_TEST_KEEP_HARDWARE").is_none().then(|| crate::hotkeys::spawn(tx.clone()));
 
     std::thread::spawn(move || {
         for conn in listener.incoming().flatten() {
@@ -291,6 +290,7 @@ pub fn run_daemon(pause: &[String]) -> Result<()> {
             enforce: true,
             on_snapshot: Box::new(|_| {}),
             paused: paused.iter().map(|p| p.name.clone()).collect(),
+            hotkeys,
         },
         rx,
     );
@@ -374,8 +374,8 @@ fn systemctl(args: &[&str]) -> Result<()> {
 /// login, and stop the given programs from autostarting (their entries are moved aside, not
 /// deleted, so `revert` can put them back).
 pub fn approve(disable: &[String]) -> Result<()> {
-    if model::load_state().active_profile.is_none() {
-        bail!("no active profile yet; switch to one and try it first");
+    if !model::graph_exists() {
+        bail!("no routing graph yet; build and save one in the editor first");
     }
     let bin = installed_bin();
     std::fs::create_dir_all(bin.parent().unwrap())?;

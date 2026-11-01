@@ -1,21 +1,23 @@
 //! Native GUI (egui): node editor, mixer and trial/approve controls.
 //!
-//! The GUI never changes routing itself. It watches PipeWire read-only, edits profile files,
-//! and asks the daemon to apply them.
+//! The GUI never changes routing itself. It watches PipeWire read-only, edits the graph file,
+//! and asks the daemon to apply it.
 
 mod graph;
 
 use crate::engine::{self, Cmd, EngineConfig};
+use crate::dsp::Reading;
 use crate::ipc::{self, Request, Response, Status};
 use crate::live::Live;
-use crate::model::{self, BusKind, NodeKind, Profile};
+use crate::model::{self, BusKind, Graph, NodeKind, Selections};
 use crate::planner;
 use crate::session::{self, KNOWN_CONFLICTS, PausedApp};
 use anyhow::{Result, anyhow};
 use egui::{Color32, RichText};
 use egui_snarl::Snarl;
 use egui_snarl::ui::{NodeLayout, PinPlacement, SnarlStyle, SnarlWidget};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -37,12 +39,11 @@ struct DaemonInfo {
     approved: bool,
     paused_pending: Vec<PausedApp>,
     running: HashMap<&'static str, bool>,
+    /// Switch selections saved on disk (used while the daemon isn't running).
+    saved_selected: Selections,
 }
 
 enum Dialog {
-    NewProfile { name: String, duplicate: bool },
-    DeleteProfile,
-    Unsaved { target: String },
     Trial { pause: Vec<(&'static str, bool)> },
     Approve { disable: Vec<(&'static str, bool)> },
     Revert,
@@ -56,16 +57,20 @@ struct App {
     toast: Arc<Mutex<Option<(String, bool, Instant)>>>,
     busy: Arc<Mutex<bool>>,
 
-    profiles: Vec<String>,
-    editing: Option<String>,
-    saved: Profile,
+    saved: Graph,
+    /// Switch selections as last clicked here, and when (shown until the daemon catches up).
+    selected: Selections,
+    selected_at: Option<Instant>,
+    /// Signal levels of processing nodes, refreshed ~25 times a second while any are shown.
+    readings: Arc<Mutex<BTreeMap<String, Reading>>>,
+    want_levels: Arc<AtomicBool>,
     snarl: Snarl<NodeKind>,
     style: SnarlStyle,
     dialog: Option<Dialog>,
     dragging: HashMap<u32, (f32, Instant)>,
     labels: model::Labels,
     /// Last unsaved version of the active profile sent to the daemon for live preview.
-    preview_sent: Option<Profile>,
+    preview_sent: Option<Graph>,
     preview_at: Instant,
     /// The daemon is currently playing unsaved edits.
     previewing: bool,
@@ -82,6 +87,7 @@ fn spawn_observer(ctx: egui::Context, live: Arc<Mutex<Live>>) -> pipewire::chann
                 ctx.request_repaint();
             }),
             paused: vec![],
+            hotkeys: None,
         };
         if let Err(e) = engine::run(cfg, rx) {
             log::error!("observer stopped: {e:#}");
@@ -103,6 +109,7 @@ fn spawn_pollers(
                 approved: session::is_approved(),
                 paused_pending: session::paused_pending(),
                 running: HashMap::new(),
+                saved_selected: model::load_state().selected,
             };
             for (name, _) in KNOWN_CONFLICTS {
                 info.running.insert(name, session::is_running(name));
@@ -119,6 +126,41 @@ fn spawn_pollers(
             *volumes.lock().unwrap() = vols;
             ctx.request_repaint();
             std::thread::sleep(Duration::from_millis(700));
+        }
+    });
+}
+
+/// Poll the daemon for levels while the graph shows any processing node. Peaks fall back
+/// gradually (about 24 dB a second) so the meters are readable.
+fn spawn_level_poller(ctx: egui::Context, readings: Arc<Mutex<BTreeMap<String, Reading>>>, want: Arc<AtomicBool>) {
+    std::thread::spawn(move || {
+        let fall = crate::dsp::db_to_lin(-1.0);
+        loop {
+            std::thread::sleep(Duration::from_millis(40));
+            if !want.load(Ordering::Relaxed) {
+                continue;
+            }
+            let Ok(Response::Levels(new)) = ipc::request(&Request::Levels) else {
+                readings.lock().unwrap().clear();
+                std::thread::sleep(Duration::from_millis(500));
+                continue;
+            };
+            let mut shown = readings.lock().unwrap();
+            let old = std::mem::take(&mut *shown);
+            for (name, r) in new {
+                let prev = old.get(&name).copied().unwrap_or(r);
+                shown.insert(
+                    name,
+                    Reading {
+                        in_peak: r.in_peak.max(prev.in_peak * fall),
+                        out_peak: r.out_peak.max(prev.out_peak * fall),
+                        gate: r.gate,
+                        limit: r.limit.min(1.0 - (1.0 - prev.limit) * 0.9),
+                    },
+                );
+            }
+            drop(shown);
+            ctx.request_repaint();
         }
     });
 }
@@ -145,6 +187,9 @@ impl App {
         let volume_ids = Arc::new(Mutex::new(Vec::new()));
         let engine = spawn_observer(cc.egui_ctx.clone(), live.clone());
         spawn_pollers(cc.egui_ctx.clone(), daemon.clone(), volumes.clone(), volume_ids.clone());
+        let readings = Arc::new(Mutex::new(BTreeMap::new()));
+        let want_levels = Arc::new(AtomicBool::new(false));
+        spawn_level_poller(cc.egui_ctx.clone(), readings.clone(), want_levels.clone());
 
         let style = SnarlStyle {
             node_layout: Some(NodeLayout::coil()),
@@ -159,9 +204,11 @@ impl App {
             volume_ids,
             toast: Arc::new(Mutex::new(None)),
             busy: Arc::new(Mutex::new(false)),
-            profiles: vec![],
-            editing: None,
-            saved: Profile::default(),
+            saved: Graph::default(),
+            selected: model::load_state().selected,
+            selected_at: None,
+            readings,
+            want_levels,
             snarl: Snarl::new(),
             style,
             dialog: None,
@@ -172,40 +219,34 @@ impl App {
             previewing: false,
             _engine: engine,
         };
-        app.refresh_profiles();
-        let first = model::load_state()
-            .active_profile
-            .filter(|p| app.profiles.contains(p))
-            .or_else(|| app.profiles.first().cloned());
-        if let Some(p) = first {
-            app.open_profile(&p);
-        }
+        app.open_graph();
         app
     }
 
-    fn refresh_profiles(&mut self) {
-        self.profiles = model::list_profiles();
-    }
-
-    fn open_profile(&mut self, name: &str) {
+    /// Load the saved graph, or a starter graph (unsaved) if there is none yet.
+    fn open_graph(&mut self) {
         self.drop_preview();
-        match model::load_profile(name) {
-            Ok(p) => {
-                self.snarl = graph::to_snarl(&p);
+        if !model::graph_exists() {
+            self.snarl = graph::to_snarl(&starter_graph());
+            self.saved = Graph::default();
+            return;
+        }
+        match model::load_graph() {
+            Ok(g) => {
+                self.snarl = graph::to_snarl(&g);
                 // Compare against the normalized form (node ids are renumbered on load).
                 self.saved = graph::from_snarl(&self.snarl);
-                self.editing = Some(name.to_owned());
             }
             Err(e) => self.notify(format!("{e:#}"), true),
         }
     }
 
-    fn current(&self) -> Profile {
+    fn current(&self) -> Graph {
         graph::from_snarl(&self.snarl)
     }
 
     fn dirty(&self) -> bool {
-        self.editing.is_some() && self.current() != self.saved
+        self.current() != self.saved
     }
 
     fn notify(&self, msg: impl Into<String>, error: bool) {
@@ -213,50 +254,66 @@ impl App {
     }
 
     fn save(&mut self) {
-        let Some(name) = self.editing.clone() else { return };
-        let profile = self.current();
-        let dupes = duplicate_bus_names(&profile);
+        let graph = self.current();
+        let dupes = model::duplicate_names(&graph);
         if !dupes.is_empty() {
-            self.notify(format!("Two virtual devices or EQs share a name: {}", dupes.join(", ")), true);
+            self.notify(format!("Two nodes share a name: {}", dupes.join(", ")), true);
             return;
         }
-        match model::save_profile(&name, &profile) {
+        match model::save_graph(&graph) {
             Ok(()) => {
-                self.saved = profile;
+                self.saved = graph;
                 self.preview_sent = None;
                 self.previewing = false;
-                let status = self.daemon.lock().unwrap().status.clone();
-                if status.and_then(|s| s.active_profile).as_deref() == Some(name.as_str()) {
+                if self.daemon.lock().unwrap().status.is_some() {
                     match ipc::request(&Request::Reload) {
                         Ok(Response::Error(e)) => self.notify(e, true),
                         Err(e) => self.notify(format!("{e:#}"), true),
-                        _ => self.notify(format!("Saved and applied {name}"), false),
+                        _ => self.notify("Saved and applied", false),
                     }
                 } else {
-                    self.notify(format!("Saved {name}"), false);
+                    self.notify("Saved", false);
                 }
             }
             Err(e) => self.notify(format!("{e:#}"), true),
         }
     }
 
-    fn activate(&mut self, name: &str) {
+    /// Use a switch pin: right away when the new system runs, else from its next start.
+    fn select(&mut self, switch: String, pin: u32) {
+        self.selected.insert(switch.clone(), pin);
+        self.selected_at = Some(Instant::now());
         if self.daemon.lock().unwrap().status.is_some() {
-            match ipc::request(&Request::Switch { profile: name.to_owned() }) {
-                Ok(Response::Error(e)) => self.notify(e, true),
-                Err(e) => self.notify(format!("{e:#}"), true),
-                _ => self.notify(format!("Switched to {name}"), false),
-            }
+            let toast = self.toast.clone();
+            std::thread::spawn(move || {
+                if let Ok(Response::Error(e)) | Err(e) = ipc::request(&Request::Select { switch, pin }).map_err(|e| format!("{e:#}")) {
+                    *toast.lock().unwrap() = Some((e, true, Instant::now()));
+                }
+            });
         } else {
-            let _ = model::save_state(&model::AppState { active_profile: Some(name.to_owned()) });
-            self.notify(format!("{name} will be used when the new system runs"), false);
+            let mut state = model::load_state();
+            state.selected = self.selected.clone();
+            if let Err(e) = model::save_state(&state) {
+                self.notify(format!("{e:#}"), true);
+            }
         }
     }
 
-    /// Edits to the active profile play live while the new system runs (about 30 updates a
-    /// second while dragging). Save makes them permanent; leaving without saving reverts them.
-    fn sync_preview(&mut self, ctx: &egui::Context, active: Option<&str>, daemon_running: bool) {
-        if !daemon_running || self.editing.is_none() || active != self.editing.as_deref() {
+    /// Which pins the switches use: what the daemon reports (or the saved choice when it isn't
+    /// running), except right after a click here, until the daemon has caught up.
+    fn effective_selected(&mut self, info: &DaemonInfo) -> Selections {
+        if self.selected_at.is_some_and(|t| t.elapsed() < Duration::from_millis(1500)) {
+            return self.selected.clone();
+        }
+        self.selected_at = None;
+        self.selected = info.status.as_ref().map(|s| s.selected.clone()).unwrap_or_else(|| info.saved_selected.clone());
+        self.selected.clone()
+    }
+
+    /// Edits play live while the new system runs (about 30 updates a second while dragging).
+    /// Save makes them permanent; discarding or closing without saving reverts them.
+    fn sync_preview(&mut self, ctx: &egui::Context, daemon_running: bool) {
+        if !daemon_running {
             return;
         }
         let current = self.current();
@@ -279,7 +336,7 @@ impl App {
         });
     }
 
-    /// Throw away live, unsaved edits: the daemon goes back to the saved profile.
+    /// Throw away live, unsaved edits: the daemon goes back to the saved graph.
     fn drop_preview(&mut self) {
         self.preview_sent = None;
         if std::mem::take(&mut self.previewing) {
@@ -304,54 +361,20 @@ impl App {
         });
     }
 
-    fn top_bar(&mut self, ui: &mut egui::Ui, active: Option<String>) {
+    fn top_bar(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
             ui.heading("Better Sound Patching");
-            ui.separator();
-            ui.label("Profile");
-            let current = self.editing.clone().unwrap_or_else(|| "—".into());
-            let mut pick = None;
-            egui::ComboBox::from_id_salt("profile")
-                .selected_text(&current)
-                .width(160.0)
-                .show_ui(ui, |ui| {
-                    for p in &self.profiles {
-                        let label = if Some(p) == active.as_ref() { format!("★ {p}") } else { p.clone() };
-                        if ui.selectable_label(Some(p) == self.editing.as_ref(), label).clicked() {
-                            pick = Some(p.clone());
-                        }
-                    }
-                });
-            if let Some(p) = pick.filter(|p| Some(p) != self.editing.as_ref()) {
-                if self.dirty() {
-                    self.dialog = Some(Dialog::Unsaved { target: p });
-                } else {
-                    self.open_profile(&p);
-                }
-            }
-            if ui.button("New").clicked() {
-                self.dialog = Some(Dialog::NewProfile { name: String::new(), duplicate: false });
-            }
-            if ui.add_enabled(self.editing.is_some(), egui::Button::new("Duplicate")).clicked() {
-                self.dialog = Some(Dialog::NewProfile { name: String::new(), duplicate: true });
-            }
-            if ui.add_enabled(self.editing.is_some(), egui::Button::new("Delete")).clicked() {
-                self.dialog = Some(Dialog::DeleteProfile);
-            }
             ui.separator();
             let dirty = self.dirty();
             if ui.add_enabled(dirty, egui::Button::new(if dirty { "Save*" } else { "Saved" })).on_hover_text("Ctrl+S").clicked() {
                 self.save();
             }
-            if let Some(name) = self.editing.clone() {
-                if active.as_deref() == Some(name.as_str()) {
-                    ui.label(RichText::new("★ active").color(Color32::from_rgb(240, 200, 80)));
-                } else if ui.button("★ Make active").on_hover_text("Switch routing to this profile (instant)").clicked() {
-                    if dirty {
-                        self.save();
-                    }
-                    self.activate(&name);
-                }
+            if ui
+                .add_enabled(dirty && model::graph_exists(), egui::Button::new("Discard changes"))
+                .on_hover_text("Go back to the saved graph")
+                .clicked()
+            {
+                self.open_graph();
             }
         });
     }
@@ -362,7 +385,7 @@ impl App {
             match (&info.status, info.approved) {
                 (Some(s), true) => {
                     ui.label(RichText::new("✔ New system active").color(Color32::from_rgb(80, 200, 120)));
-                    ui.label(format!("— starts at login · profile {}", s.active_profile.as_deref().unwrap_or("none")));
+                    ui.label(format!("— starts at login · {} links", s.links_owned));
                     if ui.add_enabled(!busy, egui::Button::new("Revert to old setup…")).clicked() {
                         self.dialog = Some(Dialog::Revert);
                     }
@@ -370,8 +393,7 @@ impl App {
                 (Some(s), false) => {
                     ui.label(RichText::new("⚠ Trial running — not permanent").color(Color32::from_rgb(230, 170, 60)));
                     ui.label(format!(
-                        "— profile {} · {} links · nothing permanent changed{}",
-                        s.active_profile.as_deref().unwrap_or("none"),
+                        "— {} links · nothing permanent changed{}",
                         s.links_owned,
                         if s.paused.is_empty() { String::new() } else { format!(" · paused: {}", s.paused.join(", ")) }
                     ));
@@ -502,73 +524,10 @@ impl App {
         egui::Modal::new(egui::Id::new("dialog")).show(ctx, |ui| {
             ui.set_max_width(460.0);
             match &mut dialog {
-                Dialog::NewProfile { name, duplicate } => {
-                    ui.heading(if *duplicate { "Duplicate profile" } else { "New profile" });
-                    let r = ui.text_edit_singleline(name);
-                    r.request_focus();
-                    let valid = model::valid_profile_name(name) && !self.profiles.contains(name);
-                    ui.horizontal(|ui| {
-                        let enter = r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
-                        if ui.add_enabled(valid, egui::Button::new("Create")).clicked() || (enter && valid) {
-                            let profile = if *duplicate { self.current() } else { starter_profile() };
-                            match model::save_profile(name, &profile) {
-                                Ok(()) => {
-                                    self.refresh_profiles();
-                                    self.open_profile(&name.clone());
-                                }
-                                Err(e) => self.notify(format!("{e:#}"), true),
-                            }
-                            keep = false;
-                        }
-                        if ui.button("Cancel").clicked() {
-                            keep = false;
-                        }
-                    });
-                }
-                Dialog::DeleteProfile => {
-                    let name = self.editing.clone().unwrap_or_default();
-                    ui.heading(format!("Delete {name}?"));
-                    ui.horizontal(|ui| {
-                        if ui.button("Delete").clicked() {
-                            if let Err(e) = model::delete_profile(&name) {
-                                self.notify(format!("{e:#}"), true);
-                            }
-                            self.refresh_profiles();
-                            self.editing = None;
-                            self.snarl = Snarl::new();
-                            self.saved = Profile::default();
-                            if let Some(p) = self.profiles.first().cloned() {
-                                self.open_profile(&p);
-                            }
-                            keep = false;
-                        }
-                        if ui.button("Cancel").clicked() {
-                            keep = false;
-                        }
-                    });
-                }
-                Dialog::Unsaved { target } => {
-                    ui.heading("Unsaved changes");
-                    ui.label(format!("Save changes to {} first?", self.editing.clone().unwrap_or_default()));
-                    ui.horizontal(|ui| {
-                        if ui.button("Save").clicked() {
-                            self.save();
-                            self.open_profile(&target.clone());
-                            keep = false;
-                        }
-                        if ui.button("Discard").clicked() {
-                            self.open_profile(&target.clone());
-                            keep = false;
-                        }
-                        if ui.button("Cancel").clicked() {
-                            keep = false;
-                        }
-                    });
-                }
                 Dialog::Trial { pause } => {
                     ui.heading("Try the new system");
                     ui.label(
-                        "Routing switches to your active profile now. Nothing permanent changes: \
+                        "Routing switches to your graph now. Nothing permanent changes: \
                          stop the trial, or simply reboot, and everything is exactly as before.",
                     );
                     ui.add_space(6.0);
@@ -578,18 +537,10 @@ impl App {
                         ui.checkbox(on, *name).on_hover_text(why);
                         ui.label(RichText::new(why).small().weak());
                     }
-                    if model::load_state().active_profile.is_none() {
-                        ui.label(RichText::new("No profile is active yet — the current one will be used.").color(Color32::from_rgb(230, 170, 60)));
-                    }
                     ui.horizontal(|ui| {
                         if ui.button("Start trial").clicked() {
                             if self.dirty() {
                                 self.save();
-                            }
-                            if model::load_state().active_profile.is_none()
-                                && let Some(p) = self.editing.clone()
-                            {
-                                let _ = model::save_state(&model::AppState { active_profile: Some(p) });
                             }
                             let names: Vec<String> = pause.iter().filter(|p| p.1).map(|p| p.0.to_owned()).collect();
                             self.background(move || {
@@ -651,15 +602,15 @@ impl App {
     }
 }
 
-/// A fresh profile: the usual virtual devices plus fallbacks, ready to wire up.
-fn starter_profile() -> Profile {
+/// A fresh graph: the usual virtual devices, ready to wire up.
+fn starter_graph() -> Graph {
     use crate::model::{BusSpec, Channels, GraphNode};
     let bus = |id, x, y, name: &str, kind, channels| GraphNode {
         id,
         pos: [x, y],
         kind: NodeKind::Bus(BusSpec { name: name.into(), kind, channels }),
     };
-    Profile {
+    Graph {
         nodes: vec![
             bus(1, 300.0, 50.0, "system-in", BusKind::Playback, Channels::Stereo),
             bus(2, 300.0, 250.0, "communication-in", BusKind::Playback, Channels::Stereo),
@@ -669,22 +620,6 @@ fn starter_profile() -> Profile {
         ],
         wires: vec![model::Wire::new(4, 1), model::Wire::new(3, 5)],
     }
-}
-
-fn duplicate_bus_names(p: &Profile) -> Vec<String> {
-    let mut seen = std::collections::HashSet::new();
-    let mut dupes = vec![];
-    for n in &p.nodes {
-        let name = match &n.kind {
-            NodeKind::Bus(b) => &b.name,
-            NodeKind::Eq(e) => &e.name,
-            _ => continue,
-        };
-        if !seen.insert(name.clone()) {
-            dupes.push(name.clone());
-        }
-    }
-    dupes
 }
 
 impl eframe::App for App {
@@ -702,15 +637,10 @@ impl eframe::App for App {
         }
         let live = self.live.lock().unwrap().clone();
         let info = self.daemon.lock().unwrap().clone();
-        let active = info
-            .status
-            .as_ref()
-            .and_then(|s| s.active_profile.clone())
-            .or_else(|| model::load_state().active_profile);
 
         egui::Panel::top("top").show(ui, |ui| {
             ui.add_space(4.0);
-            self.top_bar(ui, active.clone());
+            self.top_bar(ui);
             ui.add_space(4.0);
         });
         egui::Panel::bottom("status").show(ui, |ui| {
@@ -730,17 +660,20 @@ impl eframe::App for App {
             egui::ScrollArea::vertical().show(ui, |ui| self.mixer(ui, &live));
         });
         egui::CentralPanel::default().show(ui, |ui| {
-            if self.editing.is_none() {
-                ui.centered_and_justified(|ui| ui.label("Create a profile to get started (New)."));
-                return;
-            }
             let profile = self.current();
-            let plan = planner::plan(&profile, &live);
+            let selected = self.effective_selected(&info);
+            let plan = planner::plan(&profile, &live, &selected);
             let resolved = planner::resolve(&profile, &live);
+            let shows_levels = profile.nodes.iter().any(|n| n.kind.filter().is_some());
+            self.want_levels.store(shows_levels && info.status.is_some(), Ordering::Relaxed);
+            let readings = self.readings.lock().unwrap().clone();
             let mut viewer = graph::Viewer {
                 live: &live,
                 resolved: &resolved,
                 active_slots: &plan.active_slots,
+                readings: &readings,
+                running: info.status.is_some(),
+                select: None,
                 defaults: (plan.default_sink, plan.default_source),
                 labels: &mut self.labels,
                 labels_changed: false,
@@ -750,8 +683,12 @@ impl eframe::App for App {
                 .id(egui::Id::new("graph"))
                 .style(self.style)
                 .show(&mut self.snarl, &mut viewer, ui);
+            let (labels_changed, select) = (viewer.labels_changed, viewer.select.take());
+            if let Some((switch, pin)) = select {
+                self.select(switch, pin);
+            }
             // Labels are global (not per profile), so they save right away.
-            if viewer.labels_changed
+            if labels_changed
                 && let Err(e) = model::save_labels(&self.labels)
             {
                 self.notify(format!("saving labels: {e:#}"), true);
@@ -762,7 +699,7 @@ impl eframe::App for App {
             );
         });
         self.dialogs(&ctx);
-        self.sync_preview(&ctx, active.as_deref(), info.status.is_some());
+        self.sync_preview(&ctx, info.status.is_some());
         debug_screenshot(&ctx);
     }
 }

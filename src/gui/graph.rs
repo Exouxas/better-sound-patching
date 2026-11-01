@@ -1,10 +1,10 @@
-//! The node editor: conversion between profiles and the snarl graph, and the node viewer.
+//! The node editor: conversion between the saved graph and the snarl graph, and the node viewer.
 
+use crate::dsp::{self, Reading};
 use crate::live::{Live, LiveNode};
-use crate::dsp;
 use crate::model::{
-    AppRef, Band, BandKind, BusKind, BusSpec, Channels, DeviceRef, EqSpec, GraphNode, Labels, MAX_BANDS, NodeKind, Profile,
-    Wire,
+    AppRef, Band, BandKind, BusKind, BusSpec, Channels, DeviceRef, EqSpec, Graph, GraphNode, Labels, LevelsSpec, MAX_BANDS,
+    MAX_VOLUME, NodeKind, SwitchPin, VolumeSpec, Wire,
 };
 use egui::{Color32, Pos2, Rect, RichText, Sense, Stroke, Ui, vec2};
 use egui_snarl::ui::{PinInfo, SnarlPin, SnarlViewer};
@@ -15,7 +15,7 @@ const GREEN: Color32 = Color32::from_rgb(80, 200, 120);
 const GREY: Color32 = Color32::from_gray(110);
 const AMBER: Color32 = Color32::from_rgb(230, 170, 60);
 
-pub fn to_snarl(profile: &Profile) -> Snarl<NodeKind> {
+pub fn to_snarl(profile: &Graph) -> Snarl<NodeKind> {
     let mut snarl = Snarl::new();
     let mut ids = BTreeMap::new();
     for n in &profile.nodes {
@@ -33,7 +33,7 @@ pub fn to_snarl(profile: &Profile) -> Snarl<NodeKind> {
     snarl
 }
 
-pub fn from_snarl(snarl: &Snarl<NodeKind>) -> Profile {
+pub fn from_snarl(snarl: &Snarl<NodeKind>) -> Graph {
     let mut nodes: Vec<GraphNode> = snarl
         .nodes_pos_ids()
         .map(|(id, pos, kind)| GraphNode { id: id.0 as u32, pos: [pos.x.round(), pos.y.round()], kind: kind.clone() })
@@ -50,15 +50,21 @@ pub fn from_snarl(snarl: &Snarl<NodeKind>) -> Profile {
         .collect();
     wires.sort();
     wires.dedup();
-    Profile { nodes, wires }
+    Graph { nodes, wires }
 }
 
 pub struct Viewer<'a> {
     pub live: &'a Live,
     /// Graph node id -> live node ids it currently stands for.
     pub resolved: &'a BTreeMap<u32, Vec<u32>>,
-    /// Which pin each "first available" node is using right now.
+    /// Which pin each switch node is using right now.
     pub active_slots: &'a BTreeMap<u32, Option<u32>>,
+    /// Recent signal levels of the processing nodes, by node name.
+    pub readings: &'a BTreeMap<String, Reading>,
+    /// Whether the new system is running (processing nodes only exist then).
+    pub running: bool,
+    /// A switch pin the user clicked this frame: (switch name, pin).
+    pub select: Option<(String, u32)>,
     /// What the "Other apps" nodes made the default output / input (live ids).
     pub defaults: (Option<u32>, Option<u32>),
     /// Your names for devices (node.name -> label), edited in place.
@@ -179,27 +185,48 @@ impl Viewer<'_> {
         }
     }
 
-    fn slots_editor(&mut self, ui: &mut Ui, node: NodeId, slots: &mut u32, outputs: bool, snarl_wires: &mut Vec<(bool, usize)>) {
-        let active = self.active_slots.get(&(node.0 as u32)).copied().flatten();
-        let what = if outputs { "output" } else { "input" };
-        ui.label(RichText::new(format!("Uses pin 1 if its device is plugged in, else pin 2, and so on."))
-            .small()
-            .weak());
-        match active {
-            Some(k) => ui.label(RichText::new(format!("✔ using {what} {}", k + 1)).color(GREEN).small()),
-            None => ui.label(RichText::new("⚠ nothing connected is plugged in").color(AMBER).small()),
-        };
+    /// A switch: pick which pin is live, name the pins, and give them keyboard shortcuts.
+    fn switch_editor(&mut self, ui: &mut Ui, node: NodeId, name: &mut String, pins: &mut Vec<SwitchPin>, outputs: bool, dropped: &mut Vec<(bool, usize)>) {
         ui.horizontal(|ui| {
-            if *slots < 8 && ui.small_button("+ pin").clicked() {
-                *slots += 1;
+            ui.label("Name");
+            self.changed |= ui.add(egui::TextEdit::singleline(name).desired_width(140.0)).changed();
+        });
+        let active = self.active_slots.get(&(node.0 as u32)).copied().flatten();
+        ui.label(RichText::new(if outputs { "Click a number to send audio there." } else { "Click a number to use that input." }).small().weak());
+        for (k, pin) in pins.iter_mut().enumerate() {
+            ui.horizontal(|ui| {
+                let on = active == Some(k as u32);
+                let text = RichText::new(format!(" {} ", k + 1)).strong().color(if on { Color32::BLACK } else { GREY });
+                let b = egui::Button::new(text).fill(if on { GREEN } else { Color32::from_gray(40) });
+                if ui.add(b).on_hover_text("Use this pin").clicked() && !on {
+                    self.select = Some((name.clone(), k as u32));
+                }
+                self.changed |= ui.add(egui::TextEdit::singleline(&mut pin.label).hint_text("label").desired_width(90.0)).changed();
+                self.changed |= key_field(ui, (node, k), &mut pin.key);
+            });
+        }
+        ui.horizontal(|ui| {
+            if pins.len() < 8 && ui.small_button("+ pin").clicked() {
+                pins.push(SwitchPin::default());
                 self.changed = true;
             }
-            if *slots > 1 && ui.small_button("− pin").on_hover_text("Remove the last pin (and its wires)").clicked() {
-                *slots -= 1;
-                snarl_wires.push((outputs, *slots as usize));
+            if pins.len() > 1 && ui.small_button("− pin").on_hover_text("Remove the last pin (and its wires)").clicked() {
+                pins.pop();
+                dropped.push((outputs, pins.len()));
                 self.changed = true;
             }
         });
+        ui.label(RichText::new("Pins on different switches with the same key switch together.").small().weak());
+    }
+
+    fn reading(&self, name: &str) -> Option<Reading> {
+        self.readings.get(name).copied()
+    }
+
+    fn not_running_note(&self, ui: &mut Ui) {
+        if !self.running {
+            ui.label(RichText::new("runs when the new system is active").color(GREY).small());
+        }
     }
 
     fn device_picker(&mut self, ui: &mut Ui, id: NodeId, device: &mut Option<DeviceRef>, want_source: bool) {
@@ -265,8 +292,10 @@ impl SnarlViewer<NodeKind> for Viewer<'_> {
             NodeKind::App { app: None } => "App".into(),
             NodeKind::OtherAppsPlayback => "Other apps · playback".into(),
             NodeKind::OtherAppsRecording => "Other apps · recording".into(),
-            NodeKind::FirstOutput { .. } => "First available output".into(),
-            NodeKind::FirstInput { .. } => "First available input".into(),
+            NodeKind::SwitchOutput { name, .. } => format!("Output switch · {name}"),
+            NodeKind::SwitchInput { name, .. } => format!("Input switch · {name}"),
+            NodeKind::Levels(l) => format!("Levels · {}", l.name),
+            NodeKind::Volume(v) => format!("Volume · {}", v.name),
         }
     }
 
@@ -281,15 +310,19 @@ impl SnarlViewer<NodeKind> for Viewer<'_> {
     fn show_input(&mut self, pin: &InPin, ui: &mut Ui, snarl: &mut Snarl<NodeKind>) -> impl SnarlPin + 'static {
         let node = pin.id.node;
         match &snarl[node] {
-            NodeKind::FirstInput { .. } => {
+            NodeKind::SwitchInput { pins, .. } => {
                 let on = self.slot_active(node, pin.id.input);
-                ui.label(RichText::new(format!("{}", pin.id.input + 1)).color(if on { GREEN } else { GREY }));
+                let label = pins.get(pin.id.input).map(|p| p.label.as_str()).unwrap_or("");
+                ui.label(RichText::new(pin_text(pin.id.input, label)).color(if on { GREEN } else { GREY }));
                 Self::colored(if on { GREEN } else { GREY })
             }
-            NodeKind::FirstOutput { .. } => {
+            NodeKind::SwitchOutput { .. } => {
                 ui.label("in");
-                let on = self.active_slots.get(&(node.0 as u32)).copied().flatten().is_some();
-                Self::colored(if on { GREEN } else { GREY })
+                Self::colored(GREEN)
+            }
+            NodeKind::Levels(_) | NodeKind::Volume(_) => {
+                ui.label("in");
+                Self::colored(if self.running { GREEN } else { GREY })
             }
             NodeKind::OtherAppsRecording => {
                 ui.label("in");
@@ -305,15 +338,19 @@ impl SnarlViewer<NodeKind> for Viewer<'_> {
     fn show_output(&mut self, pin: &OutPin, ui: &mut Ui, snarl: &mut Snarl<NodeKind>) -> impl SnarlPin + 'static {
         let node = pin.id.node;
         match &snarl[node] {
-            NodeKind::FirstOutput { .. } => {
+            NodeKind::SwitchOutput { pins, .. } => {
                 let on = self.slot_active(node, pin.id.output);
-                ui.label(RichText::new(format!("{}", pin.id.output + 1)).color(if on { GREEN } else { GREY }));
+                let label = pins.get(pin.id.output).map(|p| p.label.as_str()).unwrap_or("");
+                ui.label(RichText::new(pin_text(pin.id.output, label)).color(if on { GREEN } else { GREY }));
                 Self::colored(if on { GREEN } else { GREY })
             }
-            NodeKind::FirstInput { .. } => {
+            NodeKind::SwitchInput { .. } => {
                 ui.label("out");
-                let on = self.active_slots.get(&(node.0 as u32)).copied().flatten().is_some();
-                Self::colored(if on { GREEN } else { GREY })
+                Self::colored(GREEN)
+            }
+            NodeKind::Levels(_) | NodeKind::Volume(_) => {
+                ui.label("out");
+                Self::colored(if self.running { GREEN } else { GREY })
             }
             NodeKind::OtherAppsPlayback => {
                 ui.label("out");
@@ -362,18 +399,14 @@ impl SnarlViewer<NodeKind> for Viewer<'_> {
                     if self.present(node) {
                         ui.label(RichText::new("✔ exists").color(GREEN).small());
                     } else {
-                        ui.label(RichText::new("created when the profile is active").color(GREY).small());
+                        ui.label(RichText::new("created when the new system is active").color(GREY).small());
                     }
                 }
                 NodeKind::Eq(eq) => {
                     let before = eq.clone();
                     eq_editor(ui, node, eq);
                     self.changed |= *eq != before;
-                    if self.present(node) {
-                        ui.label(RichText::new("✔ running").color(GREEN).small());
-                    } else {
-                        ui.label(RichText::new("runs when the profile is active").color(GREY).small());
-                    }
+                    self.not_running_note(ui);
                 }
                 NodeKind::App { app } => self.app_picker(ui, node, app),
                 NodeKind::OtherAppsPlayback => {
@@ -388,8 +421,22 @@ impl SnarlViewer<NodeKind> for Viewer<'_> {
                     let d = self.defaults.1;
                     self.default_note(ui, d, "input");
                 }
-                NodeKind::FirstOutput { slots } => self.slots_editor(ui, node, slots, true, &mut dropped_pins),
-                NodeKind::FirstInput { slots } => self.slots_editor(ui, node, slots, false, &mut dropped_pins),
+                NodeKind::SwitchOutput { name, pins } => self.switch_editor(ui, node, name, pins, true, &mut dropped_pins),
+                NodeKind::SwitchInput { name, pins } => self.switch_editor(ui, node, name, pins, false, &mut dropped_pins),
+                NodeKind::Levels(l) => {
+                    let reading = self.reading(&l.name);
+                    let before = l.clone();
+                    levels_editor(ui, node, l, reading);
+                    self.changed |= *l != before;
+                    self.not_running_note(ui);
+                }
+                NodeKind::Volume(v) => {
+                    let reading = self.reading(&v.name);
+                    let before = v.clone();
+                    volume_editor(ui, v, reading);
+                    self.changed |= *v != before;
+                    self.not_running_note(ui);
+                }
             }
         });
         for (output, k) in dropped_pins {
@@ -421,7 +468,7 @@ impl SnarlViewer<NodeKind> for Viewer<'_> {
             add = Some(NodeKind::Bus(BusSpec { name: "new-mic".into(), kind: BusKind::Microphone, channels: Channels::Mono }));
         }
         if ui.button("Equalizer").clicked() {
-            let mut eq = EqSpec::new(&unique_eq_name(snarl), Channels::Stereo);
+            let mut eq = EqSpec::new(&unique_name(snarl, "eq"), Channels::Stereo);
             eq.bands = default_bands();
             add = Some(NodeKind::Eq(eq));
         }
@@ -435,12 +482,18 @@ impl SnarlViewer<NodeKind> for Viewer<'_> {
         if ui.button("Other apps · recording").clicked() {
             add = Some(NodeKind::OtherAppsRecording);
         }
-        ui.separator();
-        if ui.button("First available output").on_hover_text("e.g. headset if plugged in, else speakers").clicked() {
-            add = Some(NodeKind::FirstOutput { slots: 2 });
+        if ui.button("Levels (meter, gate, limiter)").clicked() {
+            add = Some(NodeKind::Levels(LevelsSpec::new(&unique_name(snarl, "levels"))));
         }
-        if ui.button("First available input").on_hover_text("e.g. headset mic if plugged in, else webcam").clicked() {
-            add = Some(NodeKind::FirstInput { slots: 2 });
+        if ui.button("Volume").clicked() {
+            add = Some(NodeKind::Volume(VolumeSpec { name: unique_name(snarl, "volume"), channels: Channels::Stereo, gain: 1.0 }));
+        }
+        ui.separator();
+        if ui.button("Output switch").on_hover_text("Send audio to one of several outputs; you pick which").clicked() {
+            add = Some(NodeKind::SwitchOutput { name: unique_name(snarl, "Output"), pins: vec![SwitchPin::default(); 2] });
+        }
+        if ui.button("Input switch").on_hover_text("Use one of several inputs; you pick which").clicked() {
+            add = Some(NodeKind::SwitchInput { name: unique_name(snarl, "Input"), pins: vec![SwitchPin::default(); 2] });
         }
         if let Some(kind) = add {
             snarl.insert_node(pos, kind);
@@ -466,15 +519,203 @@ impl SnarlViewer<NodeKind> for Viewer<'_> {
     }
 }
 
-fn unique_eq_name(snarl: &Snarl<NodeKind>) -> String {
+/// `base-1`, `base-2`, ...: the first name no node uses yet.
+fn unique_name(snarl: &Snarl<NodeKind>, base: &str) -> String {
     let taken: Vec<String> = snarl
         .nodes()
-        .filter_map(|n| match n {
-            NodeKind::Eq(e) => Some(e.name.clone()),
-            _ => None,
-        })
+        .filter_map(|n| n.owned_name().map(str::to_owned).or_else(|| n.switch().map(|s| s.0.to_owned())))
         .collect();
-    (1..).map(|k| format!("eq-{k}")).find(|n| !taken.contains(n)).unwrap()
+    (1..).map(|k| format!("{base}-{k}")).find(|n| !taken.contains(n)).unwrap()
+}
+
+fn pin_text(k: usize, label: &str) -> String {
+    if label.is_empty() { format!("{}", k + 1) } else { format!("{} {label}", k + 1) }
+}
+
+/// A button showing a keyboard shortcut. Click it, then press the keys; Esc cancels,
+/// Backspace clears. Returns whether the key changed.
+fn key_field(ui: &mut Ui, id: impl std::hash::Hash + std::fmt::Debug, key: &mut String) -> bool {
+    let id = egui::Id::new(("key-capture", id));
+    let capturing: bool = ui.data(|d| d.get_temp(id)).unwrap_or(false);
+    let mut changed = false;
+    if capturing {
+        let pressed = ui.input(|i| {
+            i.events.iter().find_map(|e| match e {
+                egui::Event::Key { key, pressed: true, modifiers, .. } => Some((*key, *modifiers)),
+                _ => None,
+            })
+        });
+        match pressed {
+            Some((egui::Key::Escape, _)) => {ui.data_mut(|d| d.insert_temp(id, false));}
+            Some((egui::Key::Backspace | egui::Key::Delete, m)) if !m.any() => {
+                changed = !key.is_empty();
+                key.clear();
+                ui.data_mut(|d| d.insert_temp(id, false));
+            }
+            Some((k, m)) => {
+                let mut s = String::new();
+                for (on, name) in [(m.ctrl, "Ctrl"), (m.alt, "Alt"), (m.shift, "Shift"), (m.mac_cmd, "Meta")] {
+                    if on {
+                        s.push_str(name);
+                        s.push('+');
+                    }
+                }
+                s.push_str(k.name());
+                changed = *key != s;
+                *key = s;
+                ui.data_mut(|d| d.insert_temp(id, false));
+            }
+            None => {}
+        }
+    }
+    let capturing: bool = ui.data(|d| d.get_temp(id)).unwrap_or(false);
+    let text = if capturing {
+        RichText::new("press keys…").color(AMBER)
+    } else if key.is_empty() {
+        RichText::new("set key").weak()
+    } else {
+        RichText::new(key.as_str())
+    };
+    if ui.small_button(text).on_hover_text("Shortcut that selects this pin. Esc cancels, Backspace clears.").clicked() {
+        ui.data_mut(|d| d.insert_temp(id, !capturing));
+    }
+    changed
+}
+
+const METER_MIN: f32 = -60.0;
+const METER_MAX: f32 = 6.0;
+
+/// A horizontal level bar from -60 to +6 dB.
+fn meter_bar(painter: &egui::Painter, rect: Rect, peak: Option<f32>) {
+    painter.rect_filled(rect, 2.0, Color32::from_gray(22));
+    let x = |db: f32| rect.left() + rect.width() * ((db - METER_MIN) / (METER_MAX - METER_MIN)).clamp(0.0, 1.0);
+    if let Some(p) = peak {
+        let db = dsp::lin_to_db(p);
+        let color = if db > -0.5 { Color32::from_rgb(230, 80, 70) } else if db > -12.0 { AMBER } else { GREEN };
+        painter.rect_filled(Rect::from_min_max(rect.left_top(), Pos2::new(x(db), rect.bottom())), 2.0, color);
+    }
+    painter.vline(x(0.0), rect.y_range(), Stroke::new(1.0, Color32::from_gray(90)));
+}
+
+/// Levels: input and output meters, with the gate (bottom) and limiter (top) thresholds as
+/// handles you drag along the scale.
+fn levels_editor(ui: &mut Ui, node: NodeId, l: &mut LevelsSpec, reading: Option<Reading>) {
+    ui.horizontal(|ui| {
+        ui.label("Name");
+        ui.add(egui::TextEdit::singleline(&mut l.name).desired_width(110.0));
+        for (c, label) in [(Channels::Mono, "Mono"), (Channels::Stereo, "Stereo")] {
+            if ui.selectable_label(l.channels == c, label).clicked() {
+                l.channels = c;
+            }
+        }
+    });
+    let width = 260.0;
+    let (resp, painter) = ui.allocate_painter(vec2(width, 46.0), Sense::click_and_drag());
+    let r = resp.rect;
+    let scale = Rect::from_min_size(r.left_top() + vec2(0.0, 12.0), vec2(width, 34.0));
+    let x = |db: f32| scale.left() + scale.width() * ((db - METER_MIN) / (METER_MAX - METER_MIN)).clamp(0.0, 1.0);
+    let db_at = |px: f32| (METER_MIN + (px - scale.left()) / scale.width() * (METER_MAX - METER_MIN)).clamp(METER_MIN, 0.0);
+    let in_rect = Rect::from_min_size(scale.left_top() + vec2(0.0, 2.0), vec2(width, 12.0));
+    let out_rect = Rect::from_min_size(scale.left_top() + vec2(0.0, 18.0), vec2(width, 12.0));
+    meter_bar(&painter, in_rect, reading.map(|r| r.in_peak));
+    meter_bar(&painter, out_rect, reading.map(|r| r.out_peak));
+    let small = egui::FontId::proportional(9.0);
+    let dim = Color32::from_gray(160);
+    painter.text(in_rect.right_center() - vec2(2.0, 0.0), egui::Align2::RIGHT_CENTER, "in", small.clone(), dim);
+    painter.text(out_rect.right_center() - vec2(2.0, 0.0), egui::Align2::RIGHT_CENTER, "out", small.clone(), dim);
+    for db in [-48.0f32, -36.0, -24.0, -12.0, 0.0] {
+        painter.text(Pos2::new(x(db), r.top()), egui::Align2::CENTER_TOP, format!("{db:.0}"), small.clone(), GREY);
+    }
+    let gate_c = Color32::from_rgb(110, 170, 250);
+    let limit_c = Color32::from_rgb(240, 120, 90);
+    for (on, db, c) in [(l.gate_on, l.gate_db, gate_c), (l.limit_on, l.limit_db, limit_c)] {
+        if on {
+            painter.vline(x(db), scale.y_range(), Stroke::new(2.0, c));
+            painter.circle_filled(Pos2::new(x(db), scale.top()), 4.0, c);
+        }
+    }
+    // Drag whichever handle is nearest the press.
+    let drag_id = egui::Id::new(("levels-drag", node));
+    if resp.drag_started()
+        && let Some(p) = resp.interact_pointer_pos()
+    {
+        let gate_d = if l.gate_on { (x(l.gate_db) - p.x).abs() } else { f32::MAX };
+        let limit_d = if l.limit_on { (x(l.limit_db) - p.x).abs() } else { f32::MAX };
+        let which = if gate_d.min(limit_d) > 12.0 { 0u8 } else if gate_d < limit_d { 1 } else { 2 };
+        ui.data_mut(|d| d.insert_temp(drag_id, which));
+    }
+    if resp.dragged()
+        && let Some(p) = resp.interact_pointer_pos()
+    {
+        let db = (db_at(p.x) * 2.0).round() / 2.0;
+        match ui.data(|d| d.get_temp::<u8>(drag_id)).unwrap_or(0) {
+            1 => l.gate_db = db.min(l.limit_db - 3.0),
+            2 => l.limit_db = db.max(l.gate_db + 3.0),
+            _ => {}
+        }
+    }
+    resp.on_hover_text("Blue: gate (anything quieter is muted). Red: limiter (never louder than this). Drag them.");
+    ui.horizontal(|ui| {
+        ui.checkbox(&mut l.gate_on, RichText::new("Gate").color(gate_c));
+        ui.add_enabled(l.gate_on, egui::DragValue::new(&mut l.gate_db).range(METER_MIN..=0.0).speed(0.2).suffix(" dB"));
+        ui.checkbox(&mut l.limit_on, RichText::new("Limiter").color(limit_c));
+        ui.add_enabled(l.limit_on, egui::DragValue::new(&mut l.limit_db).range(METER_MIN..=0.0).speed(0.2).suffix(" dB"));
+    });
+    if let Some(r) = reading {
+        ui.horizontal(|ui| {
+            if l.gate_on {
+                let (t, c) = if r.gate > 0.5 { ("gate open", GREEN) } else { ("gate closed", GREY) };
+                ui.label(RichText::new(t).color(c).small());
+            }
+            if l.limit_on && r.limit < 0.99 {
+                ui.label(RichText::new(format!("limiting {:.1} dB", dsp::lin_to_db(r.limit))).color(limit_c).small());
+            }
+        });
+    }
+}
+
+/// Volume: a vertical fader in dB (bottom = silent) next to an output meter.
+fn volume_editor(ui: &mut Ui, v: &mut VolumeSpec, reading: Option<Reading>) {
+    ui.horizontal(|ui| {
+        ui.label("Name");
+        ui.add(egui::TextEdit::singleline(&mut v.name).desired_width(110.0));
+        for (c, label) in [(Channels::Mono, "Mono"), (Channels::Stereo, "Stereo")] {
+            if ui.selectable_label(v.channels == c, label).clicked() {
+                v.channels = c;
+            }
+        }
+    });
+    const FLOOR: f32 = -60.0;
+    let max_db = dsp::lin_to_db(MAX_VOLUME);
+    ui.horizontal(|ui| {
+        let mut db = if v.gain <= 0.0 { FLOOR } else { dsp::lin_to_db(v.gain).max(FLOOR) };
+        let r = ui.add(egui::Slider::new(&mut db, FLOOR..=max_db).vertical().show_value(false).step_by(0.5));
+        if r.changed() {
+            v.gain = if db <= FLOOR { 0.0 } else { dsp::db_to_lin(db) };
+        }
+        if r.double_clicked() {
+            v.gain = 1.0;
+        }
+        // Output meter on the same scale as the fader.
+        let (rect, _) = ui.allocate_exact_size(vec2(10.0, r.rect.height()), Sense::hover());
+        let painter = ui.painter();
+        painter.rect_filled(rect, 2.0, Color32::from_gray(22));
+        if let Some(p) = reading.map(|r| r.out_peak) {
+            let t = ((dsp::lin_to_db(p) - FLOOR) / (max_db - FLOOR)).clamp(0.0, 1.0);
+            let top = rect.bottom() - rect.height() * t;
+            painter.rect_filled(Rect::from_min_max(Pos2::new(rect.left(), top), rect.right_bottom()), 2.0, GREEN);
+        }
+        ui.vertical(|ui| {
+            ui.label(RichText::new(format!("{:.0}%", v.gain * 100.0)).strong());
+            let db_text = if v.gain <= 0.0 { "muted".to_owned() } else { format!("{:+.1} dB", dsp::lin_to_db(v.gain)) };
+            ui.label(RichText::new(db_text).small().weak());
+            ui.add(egui::DragValue::new(&mut v.gain).range(0.0..=MAX_VOLUME).speed(0.01).custom_formatter(|g, _| format!("×{g:.2}")));
+            if ui.small_button("100%").clicked() {
+                v.gain = 1.0;
+            }
+            ui.label(RichText::new("double-click the fader\nto reset").small().weak());
+        });
+    });
 }
 
 /// A neutral starting point: four bells spread over the spectrum, all at 0 dB.

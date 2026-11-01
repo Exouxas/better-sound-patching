@@ -10,26 +10,34 @@ use std::time::Duration;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum Request {
     Status,
-    /// Re-read profiles from disk (after the GUI saved).
+    /// Re-read the graph from disk (after the GUI saved, or to drop a preview).
     Reload,
-    /// Activate a profile.
-    Switch { profile: String },
-    /// Apply the editor's unsaved version of the active profile live. Dropped on reload/switch.
-    Preview { profile: crate::model::Profile },
+    /// Apply the editor's unsaved version of the graph live. Dropped on reload.
+    Preview { profile: crate::model::Graph },
+    /// Make a switch node use one of its pins (0-based).
+    Select { switch: String, pin: u32 },
+    /// A keyboard shortcut was pressed: select every switch pin bound to it.
+    Key { key: String },
+    /// Signal levels of the processing nodes since the last call, by node name.
+    Levels,
     /// Stop the daemon. Its links and buses disappear with it.
     Stop { restore_paused: bool },
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Status {
-    pub active_profile: Option<String>,
+    #[serde(default)]
+    pub graph_loaded: bool,
+    /// Switch name -> selected pin.
+    #[serde(default)]
+    pub selected: crate::model::Selections,
     pub pid: u32,
     /// Programs paused for the duration of this session (restored on stop).
     pub paused: Vec<String>,
     pub links_owned: usize,
     pub buses_owned: Vec<String>,
     #[serde(default)]
-    pub eqs_running: Vec<String>,
+    pub filters_running: Vec<String>,
     pub last_error: Option<String>,
 }
 
@@ -37,6 +45,7 @@ pub struct Status {
 pub enum Response {
     Ok,
     Status(Status),
+    Levels(std::collections::BTreeMap<String, crate::dsp::Reading>),
     Error(String),
 }
 

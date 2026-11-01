@@ -1,7 +1,8 @@
 mod dsp;
 mod engine;
-mod eqnode;
+mod filter;
 mod gui;
+mod hotkeys;
 mod ipc;
 mod live;
 mod model;
@@ -30,23 +31,27 @@ enum Cmd {
     },
     /// Start a trial session in the background (nothing persistent changes).
     Trial {
-        /// Programs to pause. Default: qpwgraph, plus easyeffects if your profile doesn't use it.
+        /// Programs to pause. Default: qpwgraph, plus easyeffects if your graph doesn't use it.
         #[arg(long)]
         pause: Vec<String>,
     },
     /// Stop the daemon and give control back to your old setup.
     Stop,
-    /// Switch to a profile instantly (bind this to a hotkey).
-    Switch { profile: String },
+    /// Make a switch node use one of its pins, e.g. `bsp select Output 2`.
+    Select {
+        switch: String,
+        /// Pin number as shown in the editor (1 = first).
+        pin: u32,
+    },
+    /// Act as if a switch shortcut was pressed: selects every pin bound to it, e.g. `bsp key Ctrl+Alt+1`.
+    Key { key: String },
     /// Show daemon status.
     Status,
-    /// Dry run: show what a profile would change right now, without touching anything.
-    Plan { profile: Option<String> },
-    /// List profiles.
-    Profiles,
+    /// Dry run: show what the graph would change right now, without touching anything.
+    Plan,
     /// Make the new system start at login. Moves the given programs' autostart entries aside.
     Approve {
-        /// Default: qpwgraph, plus easyeffects if your profile doesn't use it.
+        /// Default: qpwgraph, plus easyeffects if your graph doesn't use it.
         #[arg(long)]
         disable: Vec<String>,
     },
@@ -69,20 +74,44 @@ fn main() -> Result<()> {
             Ok(())
         }
         Cmd::Stop => session::stop_daemon(true),
-        Cmd::Switch { profile } => {
-            if !model::list_profiles().contains(&profile) {
-                bail!("no profile named {profile:?}; have: {}", model::list_profiles().join(", "));
+        Cmd::Select { switch, pin } => {
+            if pin == 0 {
+                bail!("pins are numbered from 1");
             }
+            let graph = model::load_graph()?;
+            let Some((name, pins)) = graph.nodes.iter().filter_map(|n| n.kind.switch()).find(|(n, _)| n.eq_ignore_ascii_case(&switch)) else {
+                let names: Vec<_> = graph.nodes.iter().filter_map(|n| n.kind.switch()).map(|s| s.0).collect();
+                bail!("no switch named {switch:?}; have: {}", names.join(", "));
+            };
+            if pin as usize > pins.len() {
+                bail!("{name} has only {} pins", pins.len());
+            }
+            let req = ipc::Request::Select { switch: name.to_owned(), pin: pin - 1 };
             if ipc::status().is_some() {
-                match ipc::request(&ipc::Request::Switch { profile })? {
-                    ipc::Response::Error(e) => bail!(e),
-                    _ => Ok(()),
+                if let ipc::Response::Error(e) = ipc::request(&req)? {
+                    bail!(e);
                 }
             } else {
-                model::save_state(&model::AppState { active_profile: Some(profile.clone()) })?;
-                println!("daemon not running; {profile} will be used next time it starts");
-                Ok(())
+                let mut state = model::load_state();
+                state.selected.insert(name.to_owned(), pin - 1);
+                model::save_state(&state)?;
+                println!("daemon not running; {name} will use pin {pin} next time it starts");
             }
+            Ok(())
+        }
+        Cmd::Key { key } => {
+            if ipc::status().is_some() {
+                if let ipc::Response::Error(e) = ipc::request(&ipc::Request::Key { key })? {
+                    bail!(e);
+                }
+            } else {
+                let graph = model::load_graph()?;
+                let mut state = model::load_state();
+                let n = engine::press_key(&graph, &mut state.selected, &key);
+                model::save_state(&state)?;
+                println!("daemon not running; {n} switch(es) changed for next time");
+            }
+            Ok(())
         }
         Cmd::Status => {
             match ipc::status() {
@@ -92,20 +121,7 @@ fn main() -> Result<()> {
             println!("approved: {}", session::is_approved());
             Ok(())
         }
-        Cmd::Plan { profile } => {
-            let name = profile
-                .or(model::load_state().active_profile)
-                .ok_or_else(|| anyhow::anyhow!("no profile given and none active"))?;
-            print_plan(&name)
-        }
-        Cmd::Profiles => {
-            let active = model::load_state().active_profile;
-            for p in model::list_profiles() {
-                let mark = if Some(&p) == active.as_ref() { "*" } else { " " };
-                println!("{mark} {p}");
-            }
-            Ok(())
-        }
+        Cmd::Plan => print_plan(),
         Cmd::Approve { disable } => {
             let disable = if disable.is_empty() { session::default_conflicts() } else { disable };
             session::approve(&disable)?;
@@ -136,6 +152,7 @@ fn snapshot() -> Result<live::Live> {
                 let _ = tx.send(l.clone());
             }),
             paused: vec![],
+            hotkeys: None,
         };
         let _ = engine::run(cfg, crx);
     });
@@ -147,10 +164,11 @@ fn snapshot() -> Result<live::Live> {
     Ok(live)
 }
 
-fn print_plan(name: &str) -> Result<()> {
-    let profile = model::load_profile(name)?;
+fn print_plan() -> Result<()> {
+    let profile = model::load_graph()?;
+    let selected = ipc::status().map(|s| s.selected).unwrap_or_else(|| model::load_state().selected);
     let live = snapshot()?;
-    let plan = planner::plan(&profile, &live);
+    let plan = planner::plan(&profile, &live, &selected);
     let port = |id: u32| {
         live.ports
             .get(&id)
@@ -161,16 +179,27 @@ fn print_plan(name: &str) -> Result<()> {
             .unwrap_or_else(|| format!("port {id}"))
     };
     let existing: std::collections::HashSet<_> = live.links.values().map(|l| (l.out_port, l.in_port)).collect();
-    println!("profile {name}\n\nvirtual devices:");
+    println!("virtual devices:");
     for b in &plan.buses {
         let state = if live.node_by_name(&b.name).is_some() { "exists (adopted)" } else { "would create" };
         println!("  {:<24} {state}", b.name);
     }
-    if !plan.eqs.is_empty() {
-        println!("\nequalizers:");
-        for e in &plan.eqs {
-            let state = if live.node_by_name(&e.name).is_some() { "running" } else { "would start (links through it are made then)" };
-            println!("  {:<24} {} band(s), {state}", e.name, e.bands.len());
+    if !plan.filters.is_empty() {
+        println!("\nprocessing nodes:");
+        for f in &plan.filters {
+            let state = if live.node_by_name(f.name()).is_some() { "running" } else { "would start (links through it are made then)" };
+            println!("  {:<24} {state}", f.name());
+        }
+    }
+    let switches: Vec<_> = profile.nodes.iter().filter_map(|n| Some((n.kind.switch()?, plan.active_slots.get(&n.id).copied().flatten()))).collect();
+    if !switches.is_empty() {
+        println!("\nswitches:");
+        for ((name, pins), sel) in switches {
+            let pin = sel.map(|k| {
+                let label = &pins[k as usize].label;
+                if label.is_empty() { format!("pin {}", k + 1) } else { format!("pin {} ({label})", k + 1) }
+            });
+            println!("  {:<24} {}", name, pin.unwrap_or_else(|| "no pins".into()));
         }
     }
     println!("\nlinks:");

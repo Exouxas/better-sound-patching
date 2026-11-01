@@ -1,9 +1,10 @@
-//! Turns a profile plus the live graph into the exact set of port links that should exist.
+//! Turns the routing graph plus the live PipeWire graph into the exact set of port links that
+//! should exist.
 //!
 //! This module is pure: no PipeWire calls, so it is fully unit-testable.
 
 use crate::live::{Dir, Live, LivePort};
-use crate::model::{BusSpec, EqSpec, NodeKind, Profile};
+use crate::model::{BusSpec, FilterSpec, Graph, NodeKind, Selections};
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 
 /// (output port id, input port id)
@@ -13,8 +14,8 @@ pub type PortPair = (u32, u32);
 pub struct Plan {
     /// Virtual devices the profile needs to exist.
     pub buses: Vec<BusSpec>,
-    /// Equalizers the profile needs running.
-    pub eqs: Vec<EqSpec>,
+    /// Processing nodes (EQ, levels, volume) that need to run.
+    pub filters: Vec<FilterSpec>,
     /// Links that must exist.
     pub links: BTreeSet<PortPair>,
     /// Existing links (by link id) that conflict with the profile and must be removed.
@@ -28,11 +29,11 @@ pub struct Plan {
     /// What the "Other apps" nodes want as system default output / input (live node ids).
     pub default_sink: Option<u32>,
     pub default_source: Option<u32>,
-    /// The numbered pin each "first available" node is using right now (None: nothing plugged in).
+    /// The pin each switch node uses (None: it has no pins).
     pub active_slots: BTreeMap<u32, Option<u32>>,
 }
 
-fn app_claims(profile: &Profile) -> HashSet<&str> {
+fn app_claims(profile: &Graph) -> HashSet<&str> {
     profile
         .nodes
         .iter()
@@ -44,7 +45,7 @@ fn app_claims(profile: &Profile) -> HashSet<&str> {
 }
 
 /// Which live nodes a graph node stands for right now.
-pub fn resolve(profile: &Profile, live: &Live) -> BTreeMap<u32, Vec<u32>> {
+pub fn resolve(profile: &Graph, live: &Live) -> BTreeMap<u32, Vec<u32>> {
     let claimed = app_claims(profile);
     let by_name = |name: &str| -> Vec<u32> { live.nodes.values().filter(|n| n.name == name).map(|n| n.id).collect() };
     let streams = |playback: bool| -> Vec<u32> {
@@ -60,8 +61,7 @@ pub fn resolve(profile: &Profile, live: &Live) -> BTreeMap<u32, Vec<u32>> {
         .map(|gn| {
             let ids = match &gn.kind {
                 NodeKind::Input { device: Some(d) } | NodeKind::Output { device: Some(d) } => by_name(&d.node_name),
-                NodeKind::Bus(b) => by_name(&b.name),
-                NodeKind::Eq(e) => by_name(&e.name),
+                k if k.owned_name().is_some() => by_name(k.owned_name().unwrap()),
                 NodeKind::App { app: Some(a) } => live
                     .nodes
                     .values()
@@ -77,74 +77,41 @@ pub fn resolve(profile: &Profile, live: &Live) -> BTreeMap<u32, Vec<u32>> {
         .collect()
 }
 
-/// Wires seen through "first available" switches: each real node paired with the real nodes its
-/// audio actually reaches right now, plus which pin each switch picked.
+/// The pin a switch uses: the selected one, else the first. None if it has no pins.
+pub fn selected_pin(kind: &NodeKind, selected: &Selections) -> Option<u32> {
+    let (name, pins) = kind.switch()?;
+    let k = selected.get(name).copied().unwrap_or(0);
+    (!pins.is_empty()).then(|| k.min(pins.len() as u32 - 1))
+}
+
+/// Wires seen through switches: each real node paired with the real nodes its audio actually
+/// reaches right now.
 struct Routing<'a> {
-    profile: &'a Profile,
-    resolved: &'a BTreeMap<u32, Vec<u32>>,
+    graph: &'a Graph,
     kinds: BTreeMap<u32, &'a NodeKind>,
+    active: BTreeMap<u32, Option<u32>>,
 }
 
 const MAX_DEPTH: u32 = 8;
 
 impl Routing<'_> {
-    fn present(&self, id: u32) -> bool {
-        self.resolved.get(&id).is_some_and(|v| !v.is_empty())
-    }
-
-    /// Can audio entering `id` reach anything? (Used to rank a switch's outputs.)
-    fn can_receive(&self, id: u32, depth: u32) -> bool {
-        match self.kinds.get(&id) {
-            Some(NodeKind::FirstOutput { .. }) => depth < MAX_DEPTH && self.active(id, depth + 1).is_some(),
-            // A switch's input passes on only when it is the chosen one; ranking-wise it counts as reachable.
-            Some(NodeKind::FirstInput { .. }) => true,
-            Some(NodeKind::OtherAppsRecording) => true,
-            Some(_) => self.present(id),
-            None => false,
-        }
-    }
-
-    /// Does `id` produce audio right now?
-    fn can_send(&self, id: u32, depth: u32) -> bool {
-        match self.kinds.get(&id) {
-            Some(NodeKind::FirstInput { .. }) => depth < MAX_DEPTH && self.active(id, depth + 1).is_some(),
-            Some(NodeKind::FirstOutput { .. }) => true,
-            Some(NodeKind::OtherAppsPlayback) => true,
-            Some(_) => self.present(id),
-            None => false,
-        }
-    }
-
-    /// The lowest-numbered pin of a switch whose device is available.
-    fn active(&self, id: u32, depth: u32) -> Option<u32> {
-        match self.kinds.get(&id)? {
-            NodeKind::FirstOutput { slots } => (0..*slots).find(|k| {
-                self.profile.wires.iter().any(|w| w.from == id && w.from_pin == *k && self.can_receive(w.to, depth))
-            }),
-            NodeKind::FirstInput { slots } => (0..*slots).find(|k| {
-                self.profile.wires.iter().any(|w| w.to == id && w.to_pin == *k && self.can_send(w.from, depth))
-            }),
-            _ => None,
-        }
-    }
-
     /// Real nodes reached from `id`'s output, following switches.
     fn targets(&self, id: u32, depth: u32, out: &mut Vec<u32>) {
         if depth > MAX_DEPTH {
             return;
         }
         let only_pin = match self.kinds.get(&id) {
-            Some(NodeKind::FirstOutput { .. }) => match self.active(id, 0) {
+            Some(NodeKind::SwitchOutput { .. }) => match self.active.get(&id).copied().flatten() {
                 Some(k) => Some(k),
                 None => return,
             },
             _ => None,
         };
-        for w in self.profile.wires.iter().filter(|w| w.from == id && only_pin.is_none_or(|k| w.from_pin == k)) {
+        for w in self.graph.wires.iter().filter(|w| w.from == id && only_pin.is_none_or(|k| w.from_pin == k)) {
             match self.kinds.get(&w.to) {
-                Some(NodeKind::FirstOutput { .. }) => self.targets(w.to, depth + 1, out),
-                Some(NodeKind::FirstInput { .. }) => {
-                    if self.active(w.to, 0) == Some(w.to_pin) {
+                Some(NodeKind::SwitchOutput { .. }) => self.targets(w.to, depth + 1, out),
+                Some(NodeKind::SwitchInput { .. }) => {
+                    if self.active.get(&w.to).copied().flatten() == Some(w.to_pin) {
                         self.targets(w.to, depth + 1, out);
                     }
                 }
@@ -198,12 +165,13 @@ pub fn map_channels(outs: &[&LivePort], ins: &[&LivePort]) -> Vec<PortPair> {
     pairs
 }
 
-pub fn plan(profile: &Profile, live: &Live) -> Plan {
+pub fn plan(profile: &Graph, live: &Live, selected: &Selections) -> Plan {
     let resolved = resolve(profile, live);
     let kinds: BTreeMap<u32, &NodeKind> = profile.nodes.iter().map(|n| (n.id, &n.kind)).collect();
-    let routing = Routing { profile, resolved: &resolved, kinds: kinds.clone() };
+    let active_slots: BTreeMap<u32, Option<u32>> =
+        kinds.iter().filter(|(_, k)| k.is_switch()).map(|(&id, k)| (id, selected_pin(k, selected))).collect();
+    let routing = Routing { graph: profile, kinds: kinds.clone(), active: active_slots.clone() };
     let pairs = routing.pairs();
-    let active_slots = kinds.iter().filter(|(_, k)| k.is_switch()).map(|(&id, _)| (id, routing.active(id, 0))).collect();
 
     let buses: Vec<BusSpec> = profile
         .nodes
@@ -213,14 +181,7 @@ pub fn plan(profile: &Profile, live: &Live) -> Plan {
             _ => None,
         })
         .collect();
-    let eqs: Vec<EqSpec> = profile
-        .nodes
-        .iter()
-        .filter_map(|n| match &n.kind {
-            NodeKind::Eq(e) => Some(e.clone()),
-            _ => None,
-        })
-        .collect();
+    let filters: Vec<FilterSpec> = profile.nodes.iter().filter_map(|n| n.kind.filter()).collect();
 
     // "Other apps" nodes don't link anything: they pick the system defaults, which every
     // program without its own App node follows (WirePlumber does that part).
@@ -309,7 +270,7 @@ pub fn plan(profile: &Profile, live: &Live) -> Plan {
         .map(|n| n.id)
         .collect();
 
-    Plan { buses, eqs, links, remove, managed, missing, app_streams, default_sink, default_source, active_slots }
+    Plan { buses, filters, links, remove, managed, missing, app_streams, default_sink, default_source, active_slots }
 }
 
 #[cfg(test)]
@@ -409,7 +370,7 @@ mod tests {
         let head = b.node("head", "Audio/Sink", true, &["FL", "FR"], &["FL", "FR"]);
         let mic = b.node("mic", "Audio/Source", true, &[], &["MONO"]);
         let sys_out = b.node("system-out", "Audio/Source/Virtual", false, &["MONO"], &["MONO"]);
-        let p = Profile {
+        let p = Graph {
             nodes: vec![
                 n(1, bus("system-in", BusKind::Playback, Channels::Stereo)),
                 n(2, NodeKind::Output { device: dev("head") }),
@@ -418,7 +379,7 @@ mod tests {
             ],
             wires: vec![Wire::new(1, 2), Wire::new(3, 4)],
         };
-        let plan = plan(&p, &b.live);
+        let plan = plan(&p, &b.live, &Selections::new());
         let expect: BTreeSet<_> = [
             (b.port(sys_in, Dir::Out, "FL"), b.port(head, Dir::In, "FL")),
             (b.port(sys_in, Dir::Out, "FR"), b.port(head, Dir::In, "FR")),
@@ -434,11 +395,11 @@ mod tests {
         let mut b = B::new();
         let mic = b.node("mic", "Audio/Source", true, &[], &["MONO"]);
         let head = b.node("head", "Audio/Sink", true, &["FL", "FR"], &[]);
-        let p = Profile {
+        let p = Graph {
             nodes: vec![n(1, NodeKind::Input { device: dev("mic") }), n(2, NodeKind::Output { device: dev("head") })],
             wires: vec![Wire::new(1, 2)],
         };
-        let plan = plan(&p, &b.live);
+        let plan = plan(&p, &b.live, &Selections::new());
         assert_eq!(plan.links.len(), 2);
         assert!(plan.links.contains(&(b.port(mic, Dir::Out, "MONO"), b.port(head, Dir::In, "FR"))));
     }
@@ -449,64 +410,79 @@ mod tests {
         let webcam = b.node("webcam", "Audio/Source", true, &[], &["FL", "FR"]);
         let sys_out = b.node("system-out", "Audio/Source/Virtual", false, &["MONO"], &["MONO"]);
         let stray = b.link(b.port(webcam, Dir::Out, "FL"), b.port(sys_out, Dir::In, "MONO"));
-        let p = Profile { nodes: vec![n(1, bus("system-out", BusKind::Microphone, Channels::Mono))], wires: vec![] };
-        let plan = plan(&p, &b.live);
+        let p = Graph { nodes: vec![n(1, bus("system-out", BusKind::Microphone, Channels::Mono))], wires: vec![] };
+        let plan = plan(&p, &b.live, &Selections::new());
         assert!(plan.links.is_empty());
         assert_eq!(plan.remove, vec![stray]);
     }
 
+    fn pins(n: usize) -> Vec<SwitchPin> {
+        vec![SwitchPin::default(); n]
+    }
+
     #[test]
-    fn first_output_uses_the_first_plugged_in_device() {
+    fn switch_output_uses_only_the_selected_device_and_goes_silent_without_it() {
         let mut b = B::new();
         let sys_in = b.node("system-in", "Audio/Sink", false, &["FL", "FR"], &["FL", "FR"]);
         let speakers = b.node("speakers", "Audio/Sink", true, &["FL", "FR"], &[]);
         let wire = |from, from_pin, to| Wire { from, to, from_pin, to_pin: 0 };
-        let p = Profile {
+        let p = Graph {
             nodes: vec![
                 n(1, bus("system-in", BusKind::Playback, Channels::Stereo)),
-                n(2, NodeKind::FirstOutput { slots: 2 }),
+                n(2, NodeKind::SwitchOutput { name: "Output".into(), pins: pins(2) }),
                 n(3, NodeKind::Output { device: dev("headset") }),
                 n(4, NodeKind::Output { device: dev("speakers") }),
             ],
             wires: vec![Wire::new(1, 2), wire(2, 0, 3), wire(2, 1, 4)],
         };
-        // Headset unplugged: speakers.
-        let plan1 = plan(&p, &b.live);
-        assert_eq!(plan1.active_slots[&2], Some(1));
-        assert!(plan1.links.contains(&(b.port(sys_in, Dir::Out, "FL"), b.port(speakers, Dir::In, "FL"))));
-        // Headset plugged in: headset only.
-        let head = b.node("headset", "Audio/Sink", true, &["FL", "FR"], &[]);
-        let plan2 = plan(&p, &b.live);
-        assert_eq!(plan2.active_slots[&2], Some(0));
+        // Nothing selected yet: pin 1, the headset, which is unplugged -> silence, not speakers.
+        let none = Selections::new();
+        let plan1 = plan(&p, &b.live, &none);
+        assert_eq!(plan1.active_slots[&2], Some(0));
+        assert!(plan1.links.is_empty());
+        // Select the speakers.
+        let sel: Selections = [("Output".to_string(), 1)].into();
+        let plan2 = plan(&p, &b.live, &sel);
         let expect: BTreeSet<_> = [
-            (b.port(sys_in, Dir::Out, "FL"), b.port(head, Dir::In, "FL")),
-            (b.port(sys_in, Dir::Out, "FR"), b.port(head, Dir::In, "FR")),
+            (b.port(sys_in, Dir::Out, "FL"), b.port(speakers, Dir::In, "FL")),
+            (b.port(sys_in, Dir::Out, "FR"), b.port(speakers, Dir::In, "FR")),
         ]
         .into();
         assert_eq!(plan2.links, expect);
+        // A selection past the last pin falls back to the last pin.
+        let far: Selections = [("Output".to_string(), 7)].into();
+        assert_eq!(plan(&p, &b.live, &far).active_slots[&2], Some(1));
     }
 
     #[test]
-    fn first_input_passes_the_first_plugged_in_mic() {
+    fn switch_input_passes_only_the_selected_mic_through_processing() {
         let mut b = B::new();
+        let a50 = b.node("a50-mic", "Audio/Source", true, &[], &["MONO"]);
         let index_mic = b.node("index-mic", "Audio/Source", true, &[], &["MONO"]);
+        let eq = b.node("eq-mic", "Audio/Sink", false, &["MONO"], &["MONO"]);
         let sys_out = b.node("system-out", "Audio/Source/Virtual", false, &["MONO"], &["MONO"]);
-        let p = Profile {
+        let p = Graph {
             nodes: vec![
                 n(1, NodeKind::Input { device: dev("a50-mic") }),
                 n(2, NodeKind::Input { device: dev("index-mic") }),
-                n(3, NodeKind::FirstInput { slots: 2 }),
+                n(5, NodeKind::Eq(EqSpec::new("eq-mic", Channels::Mono))),
+                n(3, NodeKind::SwitchInput { name: "Mic".into(), pins: pins(2) }),
                 n(4, bus("system-out", BusKind::Microphone, Channels::Mono)),
             ],
             wires: vec![
-                Wire { from: 1, to: 3, from_pin: 0, to_pin: 0 },
+                Wire::new(1, 5),
+                Wire { from: 5, to: 3, from_pin: 0, to_pin: 0 },
                 Wire { from: 2, to: 3, from_pin: 0, to_pin: 1 },
                 Wire::new(3, 4),
             ],
         };
-        let plan = plan(&p, &b.live);
-        assert_eq!(plan.active_slots[&3], Some(1));
-        assert_eq!(plan.links, [(b.port(index_mic, Dir::Out, "MONO"), b.port(sys_out, Dir::In, "MONO"))].into());
+        let mic_eq = (b.port(a50, Dir::Out, "MONO"), b.port(eq, Dir::In, "MONO"));
+        let a50_path = plan(&p, &b.live, &Selections::new());
+        assert_eq!(a50_path.links, [mic_eq, (b.port(eq, Dir::Out, "MONO"), b.port(sys_out, Dir::In, "MONO"))].into());
+        let sel: Selections = [("Mic".to_string(), 1)].into();
+        let index_path = plan(&p, &b.live, &sel);
+        assert_eq!(index_path.links, [mic_eq, (b.port(index_mic, Dir::Out, "MONO"), b.port(sys_out, Dir::In, "MONO"))].into());
+        assert_eq!(index_path.filters.len(), 1);
     }
 
     #[test]
@@ -536,7 +512,7 @@ mod tests {
         let wp_rec = b.link(b.port(sys_out, Dir::Out, "MONO"), b.port(discord_rec, Dir::In, "MONO"));
         let ff = b.link(b.port(firefox, Dir::Out, "FL"), b.port(sys_in, Dir::In, "FL"));
         let discord = Some(AppRef { binary: "DiscordCanary".into(), name: "Discord".into() });
-        let p = Profile {
+        let p = Graph {
             nodes: vec![
                 n(1, bus("system-in", BusKind::Playback, Channels::Stereo)),
                 n(2, bus("communication-in", BusKind::Playback, Channels::Stereo)),
@@ -544,7 +520,7 @@ mod tests {
             ],
             wires: vec![Wire::new(3, 2)],
         };
-        let plan = plan(&p, &b.live);
+        let plan = plan(&p, &b.live, &Selections::new());
         assert_eq!(plan.app_streams, [discord_play].into());
         assert!(plan.links.iter().all(|&(o, _)| o != 9000), "mic monitor routed: {:?}", plan.links);
         assert_eq!(plan.links.len(), 2);
@@ -559,7 +535,7 @@ mod tests {
         let mut b = B::new();
         let sys_in = b.node("system-in", "Audio/Sink", false, &["FL", "FR"], &["FL", "FR"]);
         let sys_out = b.node("system-out", "Audio/Source/Virtual", false, &["MONO"], &["MONO"]);
-        let p = Profile {
+        let p = Graph {
             nodes: vec![
                 n(1, NodeKind::OtherAppsPlayback),
                 n(2, bus("system-in", BusKind::Playback, Channels::Stereo)),
@@ -568,7 +544,7 @@ mod tests {
             ],
             wires: vec![Wire::new(1, 2), Wire::new(3, 4)],
         };
-        let plan = plan(&p, &b.live);
+        let plan = plan(&p, &b.live, &Selections::new());
         assert_eq!((plan.default_sink, plan.default_source), (Some(sys_in), Some(sys_out)));
         assert!(plan.links.is_empty());
     }
@@ -592,14 +568,14 @@ mod tests {
         let other_a = b.node("other-a", "Audio/Sink", false, &[], &["FL"]);
         let other_b = b.node("other-b", "Audio/Sink", false, &["FL"], &[]);
         let unrelated = b.link(b.port(other_a, Dir::Out, "FL"), b.port(other_b, Dir::In, "FL"));
-        let p = Profile {
+        let p = Graph {
             nodes: vec![
                 n(1, bus("system-in", BusKind::Playback, Channels::Stereo)),
                 n(2, NodeKind::Output { device: dev("head") }),
             ],
             wires: vec![Wire::new(1, 2)],
         };
-        let plan = plan(&p, &b.live);
+        let plan = plan(&p, &b.live, &Selections::new());
         let mut removed = plan.remove.clone();
         removed.sort();
         assert_eq!(removed, vec![stale, leftover]);
@@ -610,14 +586,14 @@ mod tests {
     fn missing_device_is_reported_and_produces_no_links() {
         let mut b = B::new();
         b.node("system-in", "Audio/Sink", false, &["FL", "FR"], &["FL", "FR"]);
-        let p = Profile {
+        let p = Graph {
             nodes: vec![
                 n(1, bus("system-in", BusKind::Playback, Channels::Stereo)),
                 n(2, NodeKind::Output { device: dev("valve-index") }),
             ],
             wires: vec![Wire::new(1, 2)],
         };
-        let plan = plan(&p, &b.live);
+        let plan = plan(&p, &b.live, &Selections::new());
         assert!(plan.links.is_empty());
         assert_eq!(plan.missing, vec![2]);
     }

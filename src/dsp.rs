@@ -1,8 +1,10 @@
-//! Equalizer math: biquad filters (RBJ audio EQ cookbook), their frequency response for the
-//! curve editor, and a per-channel processing chain. No PipeWire here, so it's unit-testable.
+//! Audio processing for the nodes that run inside the daemon: equalizer (biquads from the RBJ
+//! audio EQ cookbook), level meter with gate and limiter, and volume. No PipeWire here, so it's
+//! unit-testable. Everything that runs per sample is allocation-free.
 
-use crate::model::{Band, BandKind, MAX_BANDS};
+use crate::model::{Band, BandKind, FilterSpec, MAX_BANDS};
 use std::f64::consts::PI;
+use std::sync::atomic::{AtomicU32, Ordering};
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Coeffs {
@@ -142,6 +144,189 @@ impl Chain {
     }
 }
 
+/// Levels measured on the realtime thread, collected (and reset) by whoever displays them.
+/// All values are linear factors.
+#[derive(Default)]
+pub struct Meter {
+    in_peak: AtomicU32,
+    out_peak: AtomicU32,
+    /// Lowest gate gain since the last read (1 = open, 0 = closed).
+    gate: AtomicU32,
+    /// Lowest limiter gain since the last read (1 = not limiting).
+    limit: AtomicU32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct Reading {
+    pub in_peak: f32,
+    pub out_peak: f32,
+    pub gate: f32,
+    pub limit: f32,
+}
+
+impl Meter {
+    pub fn new() -> Self {
+        let m = Meter::default();
+        m.gate.store(1f32.to_bits(), Ordering::Relaxed);
+        m.limit.store(1f32.to_bits(), Ordering::Relaxed);
+        m
+    }
+    fn update(cell: &AtomicU32, v: f32, keep_max: bool) {
+        let _ = cell.try_update(Ordering::Relaxed, Ordering::Relaxed, |old| {
+            let o = f32::from_bits(old);
+            let better = if keep_max { v > o } else { v < o };
+            better.then_some(v.to_bits())
+        });
+    }
+    pub fn record(&self, in_peak: f32, out_peak: f32, gate: f32, limit: f32) {
+        Self::update(&self.in_peak, in_peak, true);
+        Self::update(&self.out_peak, out_peak, true);
+        Self::update(&self.gate, gate, false);
+        Self::update(&self.limit, limit, false);
+    }
+    /// Everything since the last call.
+    pub fn take(&self) -> Reading {
+        let get = |c: &AtomicU32, reset: f32| f32::from_bits(c.swap(reset.to_bits(), Ordering::Relaxed));
+        Reading { in_peak: get(&self.in_peak, 0.0), out_peak: get(&self.out_peak, 0.0), gate: get(&self.gate, 1.0), limit: get(&self.limit, 1.0) }
+    }
+}
+
+pub fn db_to_lin(db: f32) -> f32 {
+    10f32.powf(db / 20.0)
+}
+
+pub fn lin_to_db(v: f32) -> f32 {
+    20.0 * v.max(1e-6).log10()
+}
+
+/// One-pole smoothing coefficient reaching ~63% in `seconds`.
+fn coef(seconds: f32, rate: f32) -> f32 {
+    1.0 - (-1.0 / (seconds * rate).max(1.0)).exp()
+}
+
+/// Copyable settings handed to the realtime thread.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Params {
+    Eq(EqParams),
+    Levels { gate: Option<f32>, limit: Option<f32> },
+    Volume { gain: f32 },
+}
+
+impl Params {
+    pub fn from_spec(spec: &FilterSpec) -> Params {
+        match spec {
+            FilterSpec::Eq(e) => Params::Eq(EqParams::from_spec(e.preamp_db, &e.bands)),
+            FilterSpec::Levels(l) => Params::Levels {
+                gate: l.gate_on.then(|| db_to_lin(l.gate_db)),
+                limit: l.limit_on.then(|| db_to_lin(l.limit_db)),
+            },
+            FilterSpec::Volume(v) => Params::Volume { gain: v.gain.clamp(0.0, crate::model::MAX_VOLUME) },
+        }
+    }
+}
+
+/// Processing state for one node (all channels).
+pub struct Processor {
+    params: Params,
+    rate: f32,
+    chains: [Chain; MAX_CH],
+    /// Gate: envelope, gain, hold countdown (samples).
+    env: f32,
+    gate_g: f32,
+    hold: u32,
+    limit_g: f32,
+    /// Volume: smoothed gain.
+    vol_g: f32,
+}
+
+pub const MAX_CH: usize = 2;
+
+impl Processor {
+    pub fn new(params: Params) -> Self {
+        let vol_g = if let Params::Volume { gain } = params { gain } else { 1.0 };
+        Processor { params, rate: 0.0, chains: Default::default(), env: 0.0, gate_g: 1.0, hold: 0, limit_g: 1.0, vol_g }
+    }
+
+    pub fn set(&mut self, params: Params, rate: f32) {
+        self.params = params;
+        self.rate = rate;
+        if let Params::Eq(p) = &params {
+            for c in &mut self.chains {
+                c.set(p, rate as f64);
+            }
+        }
+    }
+
+    /// `ins` and `outs` have one slice per channel, all the same length.
+    pub fn process(&mut self, ins: &[&[f32]], outs: &mut [&mut [f32]], meter: &Meter) {
+        let ch = ins.len().min(outs.len()).min(MAX_CH);
+        let n = (0..ch).map(|c| ins[c].len().min(outs[c].len())).min().unwrap_or(0);
+        let peak = |bufs: &[&[f32]]| bufs.iter().flat_map(|b| b.iter()).fold(0f32, |m, v| m.max(v.abs()));
+        let in_peak = peak(ins);
+        let (mut min_gate, mut min_limit) = (1f32, 1f32);
+        match self.params {
+            Params::Eq(_) => {
+                for c in 0..ch {
+                    self.chains[c].process(&ins[c][..n], &mut outs[c][..n]);
+                }
+            }
+            Params::Volume { gain } => {
+                let k = coef(0.01, self.rate);
+                for i in 0..n {
+                    self.vol_g += (gain - self.vol_g) * k;
+                    for c in 0..ch {
+                        outs[c][i] = ins[c][i] * self.vol_g;
+                    }
+                }
+            }
+            Params::Levels { gate, limit } => {
+                let env_rel = 1.0 - coef(0.02, self.rate);
+                let (open_k, close_k, lim_rel) = (coef(0.001, self.rate), coef(0.08, self.rate), coef(0.1, self.rate));
+                let hold = (0.15 * self.rate) as u32;
+                for i in 0..n {
+                    let x = (0..ch).fold(0f32, |m, c| m.max(ins[c][i].abs()));
+                    // Gate: opens at the threshold, closes 4 dB below it after a short hold, so
+                    // the ends of words aren't chopped off.
+                    let target = match gate {
+                        None => 1.0,
+                        Some(thr) => {
+                            self.env = x.max(self.env * env_rel);
+                            if self.env >= thr {
+                                self.hold = hold;
+                            } else if self.env < thr * 0.63 && self.hold > 0 {
+                                self.hold -= 1;
+                            }
+                            if self.hold > 0 { 1.0 } else { 0.0 }
+                        }
+                    };
+                    let k = if target > self.gate_g { open_k } else { close_k };
+                    self.gate_g += (target - self.gate_g) * k;
+                    min_gate = min_gate.min(self.gate_g);
+                    // Limiter: instant attack (never lets a sample over the ceiling), smooth release.
+                    let y = x * self.gate_g;
+                    if let Some(ceiling) = limit {
+                        let want = if y > ceiling { ceiling / y } else { 1.0 };
+                        if want < self.limit_g {
+                            self.limit_g = want;
+                        } else {
+                            self.limit_g += (want - self.limit_g) * lim_rel;
+                        }
+                    } else {
+                        self.limit_g = 1.0;
+                    }
+                    min_limit = min_limit.min(self.limit_g);
+                    let g = self.gate_g * self.limit_g;
+                    for c in 0..ch {
+                        outs[c][i] = ins[c][i] * g;
+                    }
+                }
+            }
+        }
+        let out_peak = outs.iter().take(ch).flat_map(|b| b[..n].iter()).fold(0f32, |m, v| m.max(v.abs()));
+        meter.record(in_peak, out_peak, min_gate, min_limit);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -182,6 +367,55 @@ mod tests {
         let peak = output[24000..].iter().fold(0f32, |m, v| m.max(v.abs()));
         let expect = 10f64.powf((12.0 - 3.0) / 20.0) as f32;
         assert!((peak - expect).abs() / expect < 0.01, "peak {peak}, expected {expect}");
+    }
+
+    fn run(p: &mut Processor, input: &[f32]) -> Vec<f32> {
+        let meter = Meter::new();
+        let mut out = vec![0.0; input.len()];
+        for (i, o) in input.chunks(256).zip(out.chunks_mut(256)) {
+            p.process(&[i], &mut [o], &meter);
+        }
+        out
+    }
+
+    fn sine(freq: f32, amp: f32, n: usize) -> Vec<f32> {
+        (0..n).map(|i| amp * (2.0 * std::f32::consts::PI * freq * i as f32 / 48000.0).sin()).collect()
+    }
+
+    #[test]
+    fn limiter_never_lets_a_sample_over_the_ceiling() {
+        let ceiling = db_to_lin(-6.0);
+        let mut p = Processor::new(Params::Levels { gate: None, limit: Some(ceiling) });
+        p.set(Params::Levels { gate: None, limit: Some(ceiling) }, 48000.0);
+        let out = run(&mut p, &sine(440.0, 1.0, 48000));
+        let peak = out.iter().fold(0f32, |m, v| m.max(v.abs()));
+        assert!(peak <= ceiling + 1e-6, "peak {peak} over {ceiling}");
+        assert!(peak > ceiling * 0.95, "limited too much: {peak}");
+        // Quiet signals pass untouched.
+        let quiet = sine(440.0, 0.1, 48000);
+        let out = run(&mut p, &quiet);
+        assert!((out[47000] - quiet[47000]).abs() < 1e-3);
+    }
+
+    #[test]
+    fn gate_mutes_quiet_signal_and_passes_loud_signal() {
+        let params = Params::Levels { gate: Some(db_to_lin(-40.0)), limit: None };
+        let mut p = Processor::new(params);
+        p.set(params, 48000.0);
+        let hiss = run(&mut p, &sine(3000.0, db_to_lin(-55.0), 48000));
+        assert!(hiss[40000..].iter().all(|v| v.abs() < 1e-4), "hiss got through");
+        let voice = run(&mut p, &sine(300.0, db_to_lin(-20.0), 48000));
+        let peak = voice[24000..].iter().fold(0f32, |m, v| m.max(v.abs()));
+        assert!((peak - db_to_lin(-20.0)).abs() < 1e-3, "voice changed: {peak}");
+    }
+
+    #[test]
+    fn volume_multiplies() {
+        let params = Params::Volume { gain: 0.5 };
+        let mut p = Processor::new(params);
+        p.set(params, 48000.0);
+        let out = run(&mut p, &vec![0.8; 4800]);
+        assert!((out[4799] - 0.4).abs() < 1e-4);
     }
 
     #[test]
