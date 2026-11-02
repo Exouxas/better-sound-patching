@@ -106,10 +106,14 @@
 
   <!-- Text -->
   <g class="t">
-    <rect x="64" y="72" width="44" height="44" rx="11" fill="#50c878" fill-opacity="0.12" stroke="#50c878" stroke-opacity="0.5"/>
-    <path d="M 74 100 C 82 100, 82 84, 90 84 S 98 100, 98 100" fill="none" stroke="#50c878" stroke-width="2.6" stroke-linecap="round"/>
-    <circle cx="74" cy="100" r="3" fill="#50c878"/>
-    <circle cx="98" cy="100" r="3" fill="#50c878"/>
+    <!-- The app icon (assets/icon.svg), 48 px -->
+    <g transform="translate(62 70) scale(48)">
+      <rect x="0.05" y="0.05" width="0.9" height="0.9" rx="0.2" fill="#50c878" fill-opacity="0.16" stroke="#50c878" stroke-opacity="0.95" stroke-width="0.07"/>
+      <rect x="0.22" y="0.735" width="0.56" height="0.1" rx="0.05" fill="#50c878"/>
+      <path d="M 0.25 0.58 C 0.38 0.58, 0.38 0.24, 0.5 0.24 C 0.62 0.24, 0.62 0.58, 0.75 0.58" fill="none" stroke="#50c878" stroke-width="0.09" stroke-linecap="round"/>
+      <circle cx="0.25" cy="0.58" r="0.085" fill="#50c878"/>
+      <circle cx="0.75" cy="0.58" r="0.085" fill="#50c878"/>
+    </g>
     <text x="124" y="106" font-size="40" font-weight="700" fill="#e6edf3" letter-spacing="-0.5">Better Sound Patching</text>
     <text x="64" y="158" font-size="20" fill="#9da7b3">Node-based audio routing for PipeWire.</text>
     <text x="64" y="186" font-size="20" fill="#9da7b3">Set it up once, switch with one key.</text>

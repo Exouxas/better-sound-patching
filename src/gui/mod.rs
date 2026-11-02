@@ -24,6 +24,14 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 /// `BSP_SCREENSHOT_SIZE=2100x1290` opens the window at that size (for docs screenshots).
+/// The same icon as the tray (at full volume), for the window and task bar.
+fn window_icon() -> egui::IconData {
+    let size = 128;
+    let argb = crate::tray::icon(size, 1.0);
+    let rgba = argb.chunks(4).flat_map(|p| [p[1], p[2], p[3], p[0]]).collect();
+    egui::IconData { rgba, width: size, height: size }
+}
+
 fn window_size() -> [f32; 2] {
     std::env::var("BSP_SCREENSHOT_SIZE")
         .ok()
@@ -39,7 +47,8 @@ pub fn run() -> Result<()> {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size(window_size())
             .with_title("Better Sound Patching")
-            .with_app_id("better-sound-patching"),
+            .with_app_id("better-sound-patching")
+            .with_icon(window_icon()),
         ..Default::default()
     };
     eframe::run_native("Better Sound Patching", options, Box::new(|cc| Ok(Box::new(App::new(cc)))))

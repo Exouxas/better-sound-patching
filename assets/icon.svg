@@ -1,0 +1,8 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="256" height="256" viewBox="0 0 1 1">
+  <!-- Better Sound Patching. Same shapes as the tray icon (src/tray.rs), at full volume. -->
+  <rect x="0.05" y="0.05" width="0.9" height="0.9" rx="0.2" fill="#50c878" fill-opacity="0.16" stroke="#50c878" stroke-opacity="0.95" stroke-width="0.07"/>
+  <rect x="0.22" y="0.735" width="0.56" height="0.1" rx="0.05" fill="#50c878"/>
+  <path d="M 0.25 0.58 C 0.38 0.58, 0.38 0.24, 0.5 0.24 C 0.62 0.24, 0.62 0.58, 0.75 0.58" fill="none" stroke="#50c878" stroke-width="0.09" stroke-linecap="round"/>
+  <circle cx="0.25" cy="0.58" r="0.085" fill="#50c878"/>
+  <circle cx="0.75" cy="0.58" r="0.085" fill="#50c878"/>
+</svg>

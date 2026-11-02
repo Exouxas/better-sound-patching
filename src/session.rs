@@ -165,7 +165,9 @@ fn launch_detached(cmd: &[String]) -> Result<()> {
 /// Open the editor as its own program. Started through systemd when possible, so it isn't
 /// part of the daemon's service and keeps running if the daemon restarts.
 pub fn open_editor() -> Result<()> {
-    let exe = std::env::current_exe()?.to_string_lossy().into_owned();
+    // After an update replaced the file, Linux reports our own path with " (deleted)" on the
+    // end; the new program is at the plain path.
+    let exe = std::env::current_exe()?.to_string_lossy().trim_end_matches(" (deleted)").to_owned();
     let via_systemd = Command::new("systemd-run")
         .args(["--user", "--collect", "--quiet", "--unit"])
         .arg(format!("better-sound-patching-editor-{}", std::process::id() ^ (std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().subsec_nanos())))
@@ -479,11 +481,14 @@ pub fn revert() -> Result<()> {
 }
 
 fn install_desktop_entry(bin: &Path) -> Result<()> {
+    let icons = dirs::data_dir().unwrap_or_default().join("icons/hicolor/scalable/apps");
+    std::fs::create_dir_all(&icons)?;
+    model::write_atomic(&icons.join("better-sound-patching.svg"), include_str!("../assets/icon.svg"))?;
     let dir = dirs::data_dir().unwrap_or_default().join("applications");
     std::fs::create_dir_all(&dir)?;
     let entry = format!(
         "[Desktop Entry]\nType=Application\nName=Better Sound Patching\n\
-         Comment=Audio routing and mixer\nExec={} gui\nIcon=audio-card\n\
+         Comment=Audio routing and mixer\nExec={} gui\nIcon=better-sound-patching\n\
          Categories=AudioVideo;Audio;Mixer;\n",
         bin.display()
     );
