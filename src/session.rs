@@ -164,12 +164,16 @@ fn launch_detached(cmd: &[String]) -> Result<()> {
 
 /// Open the editor as its own program. Started through systemd when possible, so it isn't
 /// part of the daemon's service and keeps running if the daemon restarts.
-pub fn open_editor() -> Result<()> {
+/// `activation` is the desktop's token for the click that asked for it (lets the new window
+/// take focus on Wayland).
+pub fn open_editor(activation: Option<String>) -> Result<()> {
     // After an update replaced the file, Linux reports our own path with " (deleted)" on the
     // end; the new program is at the plain path.
     let exe = std::env::current_exe()?.to_string_lossy().trim_end_matches(" (deleted)").to_owned();
     let via_systemd = Command::new("systemd-run")
-        .args(["--user", "--collect", "--quiet", "--unit"])
+        .args(["--user", "--collect", "--quiet"])
+        .args(activation.iter().flat_map(|t| ["--setenv".to_owned(), format!("XDG_ACTIVATION_TOKEN={t}")]))
+        .arg("--unit")
         .arg(format!("better-sound-patching-editor-{}", std::process::id() ^ (std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().subsec_nanos())))
         .args([exe.as_str(), "gui"])
         .stdin(Stdio::null())

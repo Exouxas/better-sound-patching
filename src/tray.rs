@@ -31,6 +31,12 @@ pub fn spawn(engine: pipewire::channel::Sender<Cmd>) -> Option<Handle> {
     }
 }
 
+fn open() {
+    if let Err(e) = crate::session::open_editor(ksni::current_xdg_activation_token()) {
+        log::warn!("opening the editor: {e:#}");
+    }
+}
+
 /// Tell the tray the master volume changed elsewhere (the editor, or at start).
 pub fn show_master(handle: &Handle, master: f32) {
     handle.update(|t| t.master = master);
@@ -76,9 +82,10 @@ impl ksni::Tray for Tray {
         }
     }
 
+    /// Click: close the editor if it's open, else open it.
     fn activate(&mut self, _x: i32, _y: i32) {
-        if let Err(e) = crate::session::open_editor() {
-            log::warn!("opening the editor: {e:#}");
+        if !crate::gui::single::ask(crate::gui::single::Ask::Close) {
+            open();
         }
     }
 
@@ -99,7 +106,11 @@ impl ksni::Tray for Tray {
             StandardItem {
                 label: "Open editor".into(),
                 icon_name: "audio-card".into(),
-                activate: Box::new(|t: &mut Self| t.activate(0, 0)),
+                activate: Box::new(|_: &mut Self| {
+                    if !crate::gui::single::ask(crate::gui::single::Ask::Show) {
+                        open();
+                    }
+                }),
                 ..Default::default()
             }
             .into(),

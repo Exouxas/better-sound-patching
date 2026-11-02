@@ -5,6 +5,7 @@
 
 mod clipboard;
 mod graph;
+pub mod single;
 
 use crate::engine::{self, Cmd, EngineConfig};
 use crate::dsp::Reading;
@@ -23,7 +24,6 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-/// `BSP_SCREENSHOT_SIZE=2100x1290` opens the window at that size (for docs screenshots).
 /// The same icon as the tray (at full volume), for the window and task bar.
 fn window_icon() -> egui::IconData {
     let size = 128;
@@ -32,6 +32,7 @@ fn window_icon() -> egui::IconData {
     egui::IconData { rgba, width: size, height: size }
 }
 
+/// `BSP_SCREENSHOT_SIZE=2100x1290` opens the window at that size (for docs screenshots).
 fn window_size() -> [f32; 2] {
     std::env::var("BSP_SCREENSHOT_SIZE")
         .ok()
@@ -43,6 +44,19 @@ fn window_size() -> [f32; 2] {
 }
 
 pub fn run() -> Result<()> {
+    // One editor at a time (screenshot runs for the docs aside).
+    let listener = if std::env::var_os("BSP_SCREENSHOT").is_some() {
+        None
+    } else {
+        match single::claim() {
+            Some(l) => Some(l),
+            None => {
+                single::ask(single::Ask::Show);
+                println!("The editor is already open.");
+                return Ok(());
+            }
+        }
+    };
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size(window_size())
@@ -51,7 +65,11 @@ pub fn run() -> Result<()> {
             .with_icon(window_icon()),
         ..Default::default()
     };
-    eframe::run_native("Better Sound Patching", options, Box::new(|cc| Ok(Box::new(App::new(cc)))))
+    eframe::run_native("Better Sound Patching", options, Box::new(move |cc| {
+        let mut app = App::new(cc);
+        app.requests = listener.map(|l| single::serve(l, cc.egui_ctx.clone()));
+        Ok(Box::new(app))
+    }))
         .map_err(|e| anyhow!("{e}"))
 }
 
@@ -105,6 +123,8 @@ struct App {
     /// The daemon is currently playing unsaved edits.
     previewing: bool,
     _engine: pipewire::channel::Sender<Cmd>,
+    /// Requests from other programs (the tray icon, a second editor).
+    requests: Option<std::sync::mpsc::Receiver<single::Ask>>,
 }
 
 fn spawn_observer(ctx: egui::Context, live: Arc<Mutex<Live>>) -> pipewire::channel::Sender<Cmd> {
@@ -265,6 +285,7 @@ impl App {
             preview_at: Instant::now(),
             previewing: false,
             _engine: engine,
+            requests: None,
         };
         app.open_graph();
         app
@@ -334,6 +355,23 @@ impl App {
                     clipboard::remove(&mut self.snarl, &selected);
                 }
                 _ => {}
+            }
+        }
+    }
+
+    /// Come forward, or close, when the tray icon or another editor asks.
+    fn answer_requests(&mut self, ctx: &egui::Context) {
+        let asks: Vec<single::Ask> = self.requests.as_ref().map(|r| r.try_iter().collect()).unwrap_or_default();
+        for ask in asks {
+            let close = ask == single::Ask::Close && !self.dirty();
+            if close {
+                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                continue;
+            }
+            ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
+            ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+            if ask == single::Ask::Close {
+                self.notify("You have unsaved changes: Save or Discard them, then close.", true);
             }
         }
     }
@@ -880,6 +918,9 @@ fn starter_graph() -> Graph {
 
 impl eframe::App for App {
     fn on_exit(&mut self) {
+        if self.requests.is_some() {
+            single::release();
+        }
         // Closing without saving: don't leave unsaved edits playing.
         if self.previewing {
             let _ = ipc::request(&Request::Reload);
@@ -888,6 +929,7 @@ impl eframe::App for App {
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
+        self.answer_requests(&ctx);
         if ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::S)) {
             self.save();
         }
