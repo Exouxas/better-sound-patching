@@ -123,6 +123,9 @@ struct App {
     /// The daemon is currently playing unsaved edits.
     previewing: bool,
     _engine: pipewire::channel::Sender<Cmd>,
+    /// The unsaved changes last written to the draft file, and when.
+    draft_written: Option<Graph>,
+    draft_at: Instant,
     /// Requests from other programs (the tray icon, a second editor).
     requests: Option<std::sync::mpsc::Receiver<single::Ask>>,
 }
@@ -286,13 +289,29 @@ impl App {
             previewing: false,
             _engine: engine,
             requests: None,
+            draft_written: None,
+            draft_at: Instant::now(),
         };
-        app.open_graph();
+        app.open_graph(true);
         app
     }
 
-    /// Load the saved graph, or a starter graph (unsaved) if there is none yet.
-    fn open_graph(&mut self) {
+    /// Load the saved graph, or a starter graph (unsaved) if there is none yet; with
+    /// `restore`, then your unsaved changes from last time on top.
+    fn open_graph(&mut self, restore: bool) {
+        self.load_saved();
+        let draft = if restore { model::load_draft() } else { None };
+        match draft {
+            Some(d) if d != self.saved => {
+                self.snarl = graph::to_snarl(&d);
+                self.draft_written = Some(d);
+                self.notify("Your unsaved changes from last time are back: Save or Discard them", false);
+            }
+            _ => model::delete_draft(),
+        }
+    }
+
+    fn load_saved(&mut self) {
         self.drop_preview();
         self.fit_pending = true;
         if !model::graph_exists() {
@@ -363,16 +382,40 @@ impl App {
     fn answer_requests(&mut self, ctx: &egui::Context) {
         let asks: Vec<single::Ask> = self.requests.as_ref().map(|r| r.try_iter().collect()).unwrap_or_default();
         for ask in asks {
-            let close = ask == single::Ask::Close && !self.dirty();
-            if close {
-                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
-                continue;
+            match ask {
+                // Unsaved changes are kept (see `keep_draft`), so closing loses nothing.
+                single::Ask::Close => ctx.send_viewport_cmd(egui::ViewportCommand::Close),
+                single::Ask::Show => {
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+                }
             }
-            ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
-            ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
-            if ask == single::Ask::Close {
-                self.notify("You have unsaved changes: Save or Discard them, then close.", true);
+        }
+    }
+
+    /// Keep unsaved changes in the draft file (a second after the last edit, and on close),
+    /// and remove it once there are none.
+    fn keep_draft(&mut self, now: bool) {
+        if std::env::var_os("BSP_SCREENSHOT").is_some() {
+            return;
+        }
+        let current = self.current();
+        if current == self.saved {
+            if self.draft_written.take().is_some() || now {
+                model::delete_draft();
             }
+            return;
+        }
+        if self.draft_written.as_ref() == Some(&current) {
+            return;
+        }
+        if !now && self.draft_at.elapsed() < Duration::from_secs(1) {
+            return;
+        }
+        self.draft_at = Instant::now();
+        match model::save_draft(&current) {
+            Ok(()) => self.draft_written = Some(current),
+            Err(e) => self.notify(format!("keeping unsaved changes: {e:#}"), true),
         }
     }
 
@@ -540,7 +583,7 @@ impl App {
                 .on_hover_text("Go back to the saved graph")
                 .clicked()
             {
-                self.open_graph();
+                self.open_graph(false);
             }
             ui.separator();
             if ui.button("Fit view").on_hover_text("Zoom to show the whole graph").clicked() {
@@ -918,6 +961,7 @@ fn starter_graph() -> Graph {
 
 impl eframe::App for App {
     fn on_exit(&mut self) {
+        self.keep_draft(true);
         if self.requests.is_some() {
             single::release();
         }
@@ -930,6 +974,7 @@ impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
         self.answer_requests(&ctx);
+        self.keep_draft(false);
         if ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::S)) {
             self.save();
         }

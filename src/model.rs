@@ -386,6 +386,24 @@ pub fn load_graph() -> Result<Graph> {
     toml::from_str(&text).with_context(|| format!("parsing {}", path.display()))
 }
 
+/// Unsaved changes from the editor, kept between sessions until you Save or Discard them.
+fn draft_path() -> PathBuf {
+    config_dir().join("draft.toml")
+}
+
+pub fn load_draft() -> Option<Graph> {
+    toml::from_str(&std::fs::read_to_string(draft_path()).ok()?).ok()
+}
+
+pub fn save_draft(graph: &Graph) -> Result<()> {
+    std::fs::create_dir_all(config_dir())?;
+    write_atomic(&draft_path(), &toml::to_string_pretty(graph)?)
+}
+
+pub fn delete_draft() {
+    let _ = std::fs::remove_file(draft_path());
+}
+
 pub fn save_graph(graph: &Graph) -> Result<()> {
     std::fs::create_dir_all(config_dir())?;
     write_atomic(&graph_path(), &toml::to_string_pretty(graph)?)
