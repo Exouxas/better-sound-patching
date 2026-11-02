@@ -17,7 +17,7 @@ switch from headset to speakers with one key: the routing stays what you drew.
 It is written entirely in Rust with a native GUI. There is no Electron, no web view, and no JavaScript.
 
 <p align="center">
-  <img src="docs/images/editor.png" alt="The editor: programs and virtual devices on the left, EQ and switch nodes in the middle, hardware on the right, with the mixer panel" width="100%">
+  <img src="docs/images/editor.png" alt="The editor: programs and virtual devices on the left, EQ and switch nodes in the middle, hardware on the right, with the mixer and its master volume on the right" width="100%">
 </p>
 
 ## Highlights
@@ -31,9 +31,15 @@ It is written entirely in Rust with a native GUI. There is no Electron, no web v
   together, so one key can move both output and mic to your VR headset.
 - **Built-in processing.** A parametric **EQ** with a draggable curve, a **Levels** node (meters, noise
   gate, limiter) and a **Volume** node all run inside the daemon on PipeWire's realtime thread.
+- **Master volume and a tray icon.** One slider turns everything you hear up or down together, keeping
+  the balance between programs. Scroll over the tray icon to change it; click the icon to open the editor.
+- **Your names, everywhere.** A virtual device's label is the name programs and your desktop's sound
+  settings show, so `system-in` can be "Game & music".
 - **Per-program routing.** Give Discord (or anything else) its own node; every other program follows the
   "Other apps" nodes, which set the system default devices.
 - **Unused hardware stays silent**, like Voicemeeter: nothing reaches a device unless the graph says so.
+- **Takes over your old setup.** Virtual devices your PipeWire config already makes are adopted as they
+  are; one button moves that config aside so this program makes them instead.
 - **Safe to try.** A trial changes nothing permanent. Stop it, or reboot, and your old setup is back.
 
 ## How it works
@@ -46,6 +52,13 @@ The daemon owns everything it creates (links, virtual devices, processing nodes)
 `object.linger = false`, so if it stops or crashes, it all disappears with it. When it lets go of a
 program, it hands that program back to the default device first, so nothing is ever left silent.
 
+Right after each virtual output sits a hidden gain stage: the **master volume**. Moving it changes one
+number on the realtime thread; nothing is relinked, so there are no gaps.
+
+When the default output has to be replaced (renamed, or taken over from your PipeWire config), programs
+are first moved to a silent stand-in, so they never fall back to a real device for a moment, unprocessed
+and possibly far louder than your graph would make them.
+
 ## Nodes
 
 <p align="center">
@@ -54,7 +67,7 @@ program, it hands that program back to the default device first, so nothing is e
 
 | Node | What it does |
 |---|---|
-| **Virtual output / Virtual mic** | A device programs can play into or record from. Created by the daemon. |
+| **Virtual output / Virtual mic** | A device programs can play into or record from. Created by the daemon; its label is the name programs see. |
 | **Input device / Output device** | A real microphone, headset or speaker. Shows whether it's plugged in. |
 | **App** | One program. Its *out* is what it plays, its *in* is what it hears as a microphone. |
 | **Other apps · playback / recording** | Every program without its own App node. Wiring them to a device makes it the system default. |
@@ -63,13 +76,29 @@ program, it hands that program back to the default device first, so nothing is e
 | **Volume** | A 0–200% slider, or type any value up to 1000%. |
 | **Output switch / Input switch** | Numbered pins; exactly one is live. Click it, run `bsp select`, or press its key. |
 
+### Editing
+
+| Action | How |
+|---|---|
+| Add a node | Right-click the background |
+| Connect | Drag from an **out** pin to an **in** pin; right-click a wire to remove it |
+| Select | Click a node, or drag a box on the background (Shift adds, Ctrl removes) |
+| Move | Drag a node; dragging one of several selected nodes moves them all |
+| Pan / zoom | Right- or middle-drag / scroll wheel; **Fit view** shows everything |
+| Copy, cut, paste | Ctrl+C, Ctrl+X, Ctrl+V. Pasted nodes land at the pointer, with their wires, and get free names |
+| Delete | Del |
+
+Copied nodes go to the clipboard as plain text, so you can paste them into another window or keep a
+favourite EQ in a text file.
+
 ## Getting started
 
 ### Requirements
 
 - Linux with **PipeWire** 1.x and **WirePlumber** 0.5
 - **Rust** 1.95 or newer and **clang**, which the PipeWire bindings need to build
-- Optional: a desktop with the XDG GlobalShortcuts portal (KDE Plasma 6, for example) for global keys
+- Optional: a desktop with the XDG GlobalShortcuts portal for global keys, and a system tray
+  (StatusNotifierItem) for the tray icon. KDE Plasma 6 has both.
 
 ### Build
 
@@ -88,7 +117,8 @@ Nothing changes until you ask, and every step can be undone:
 |---|---|---|
 | `bsp` / `bsp plan` | Nothing. The editor and the dry run only read. | — |
 | `bsp trial` (or **Try the new system…**) | Routing follows your graph; qpwgraph and EasyEffects are paused for this session. | `bsp stop`, or reboot |
-| `bsp approve` | Installs `~/.local/bin/bsp` and a systemd user service; moves conflicting autostart entries aside. | `bsp revert` |
+| `bsp approve` | Installs `~/.local/bin/bsp`, a systemd user service (with the tray icon) and a menu entry; moves conflicting autostart entries aside. | `bsp revert` |
+| **Take over…** (after approving) | Moves the PipeWire config that makes your virtual devices into a backup folder; the daemon makes them instead, so their labels become their names. | `bsp revert` puts it back and restarts PipeWire |
 
 ## Command line
 
@@ -111,14 +141,17 @@ Everything lives in `~/.config/better-sound-patching/` as plain TOML, safe to ba
 | File | Contents |
 |---|---|
 | `graph.toml` | The routing graph: nodes, their settings and the wires between them |
-| `state.toml` | Which pin each switch is using |
-| `labels.toml` | Your own names for devices and programs |
+| `state.toml` | Which pin each switch is using, and the master volume |
+| `labels.toml` | Your own names for hardware devices and programs (shown in the editor) |
+| `moved-pipewire-config/` | PipeWire config moved aside by **Take over**, and where it came from |
 
 ## Design notes
 
 - **No JavaScript, no web stack.** GUI: [egui](https://github.com/emilk/egui) with
-  [egui-snarl](https://github.com/zakarumych/egui-snarl). Audio: [pipewire-rs](https://gitlab.freedesktop.org/pipewire/pipewire-rs),
-  plus a small FFI layer for `pw_filter`.
+  [egui-snarl](https://github.com/zakarumych/egui-snarl) (a lightly patched copy in `vendor/`, for
+  click-to-select and easier pin grabbing; see `vendor/egui-snarl/BSP-CHANGES.md`).
+  Audio: [pipewire-rs](https://gitlab.freedesktop.org/pipewire/pipewire-rs), plus a small FFI layer for
+  `pw_filter`. Tray: [ksni](https://github.com/iovxw/ksni).
 - **Pure planning.** The planner turns *graph + live PipeWire state* into the exact set of links that
   should exist. It makes no PipeWire calls, so it is fully unit-tested.
 - **Allocation-free DSP.** EQ biquads run in 64-bit floats; the limiter has an instant attack, so no
