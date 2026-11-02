@@ -61,14 +61,11 @@ impl ksni::Tray for Tray {
         ksni::Category::Hardware
     }
 
-    fn icon_name(&self) -> String {
-        match self.master {
-            m if m <= 0.0 => "audio-volume-muted",
-            m if m < 0.34 => "audio-volume-low",
-            m if m < 0.67 => "audio-volume-medium",
-            _ => "audio-volume-high",
-        }
-        .into()
+    fn icon_pixmap(&self) -> Vec<ksni::Icon> {
+        [16, 22, 24, 32, 48, 64]
+            .into_iter()
+            .map(|size| ksni::Icon { width: size as i32, height: size as i32, data: icon(size, self.master) })
+            .collect()
     }
 
     fn tool_tip(&self) -> ToolTip {
@@ -123,5 +120,93 @@ impl ksni::Tray for Tray {
             }
             .into(),
         ]
+    }
+}
+
+/// Our own icon, so it isn't mistaken for the desktop's volume icon: the app's patch-cable
+/// logo in a rounded square, with the master volume as a bar along the bottom. Grey when muted.
+/// ARGB32 rows, big-endian, as the tray expects.
+pub fn icon(size: u32, master: f32) -> Vec<u8> {
+    type P = (f32, f32);
+    const GREEN: [f32; 3] = [80.0, 200.0, 120.0];
+    const GREY: [f32; 3] = [150.0, 155.0, 160.0];
+    let muted = master <= 0.0;
+    let ink = if muted { GREY } else { GREEN };
+
+    fn seg_dist(p: P, a: P, b: P) -> f32 {
+        let (abx, aby) = (b.0 - a.0, b.1 - a.1);
+        let t = (((p.0 - a.0) * abx + (p.1 - a.1) * aby) / (abx * abx + aby * aby)).clamp(0.0, 1.0);
+        ((p.0 - a.0 - t * abx).powi(2) + (p.1 - a.1 - t * aby).powi(2)).sqrt()
+    }
+    /// Signed distance to a rounded rectangle (centre, half size, corner radius).
+    fn round_rect(p: P, c: P, half: P, r: f32) -> f32 {
+        let (qx, qy) = ((p.0 - c.0).abs() - half.0 + r, (p.1 - c.1).abs() - half.1 + r);
+        (qx.max(0.0).powi(2) + qy.max(0.0).powi(2)).sqrt() + qx.max(qy).min(0.0) - r
+    }
+    // The cable: up from the left socket, over the top, down to the right socket.
+    let (a, b) = ((0.25, 0.58), (0.75, 0.58));
+    let bez = |t: f32, p0: P, p1: P, p2: P, p3: P| -> P {
+        let u = 1.0 - t;
+        (
+            u * u * u * p0.0 + 3.0 * u * u * t * p1.0 + 3.0 * u * t * t * p2.0 + t * t * t * p3.0,
+            u * u * u * p0.1 + 3.0 * u * u * t * p1.1 + 3.0 * u * t * t * p2.1 + t * t * t * p3.1,
+        )
+    };
+    let mut cable: Vec<P> = (0..=16).map(|i| bez(i as f32 / 16.0, a, (0.38, 0.58), (0.38, 0.24), (0.5, 0.24))).collect();
+    cable.extend((1..=16).map(|i| bez(i as f32 / 16.0, (0.5, 0.24), (0.62, 0.24), (0.62, 0.58), b)));
+    let bar = (0.22, 0.78, 0.735, 0.835); // x0, x1, y0, y1
+    let level_x = bar.0 + (bar.1 - bar.0) * master.clamp(0.0, 1.0);
+
+    // Layers, bottom to top: (colour, opacity, is this sample inside?).
+    let layers: [([f32; 3], f32, &dyn Fn(P) -> bool); 6] = [
+        (ink, 0.16, &|p| round_rect(p, (0.5, 0.5), (0.45, 0.45), 0.2) <= 0.0),
+        (ink, 0.95, &|p| round_rect(p, (0.5, 0.5), (0.45, 0.45), 0.2).abs() <= 0.035),
+        (GREY, 0.45, &|p| round_rect(p, (0.5, (bar.2 + bar.3) / 2.0), ((bar.1 - bar.0) / 2.0, (bar.3 - bar.2) / 2.0), 0.05) <= 0.0),
+        (ink, 1.0, &|p| p.0 <= level_x && round_rect(p, (0.5, (bar.2 + bar.3) / 2.0), ((bar.1 - bar.0) / 2.0, (bar.3 - bar.2) / 2.0), 0.05) <= 0.0),
+        (ink, 1.0, &|p| cable.windows(2).any(|w| seg_dist(p, w[0], w[1]) <= 0.045)),
+        (ink, 1.0, &|p| seg_dist(p, a, a) <= 0.085 || seg_dist(p, b, b) <= 0.085),
+    ];
+
+    const SS: u32 = 4;
+    let mut out = Vec::with_capacity((size * size * 4) as usize);
+    for y in 0..size {
+        for x in 0..size {
+            let (mut r, mut g, mut bl, mut al) = (0.0f32, 0.0f32, 0.0f32, 0.0f32);
+            for (color, opacity, inside) in &layers {
+                let mut hits = 0;
+                for sy in 0..SS {
+                    for sx in 0..SS {
+                        let p = ((x as f32 + (sx as f32 + 0.5) / SS as f32) / size as f32, (y as f32 + (sy as f32 + 0.5) / SS as f32) / size as f32);
+                        if inside(p) {
+                            hits += 1;
+                        }
+                    }
+                }
+                let src = opacity * hits as f32 / (SS * SS) as f32;
+                if src <= 0.0 {
+                    continue;
+                }
+                // "Over", in straight alpha.
+                let out_a = src + al * (1.0 - src);
+                let mix = |c: f32, d: f32| (c * src + d * al * (1.0 - src)) / out_a;
+                (r, g, bl) = (mix(color[0], r), mix(color[1], g), mix(color[2], bl));
+                al = out_a;
+            }
+            out.extend_from_slice(&[(al * 255.0).round() as u8, r.round() as u8, g.round() as u8, bl.round() as u8]);
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn icon_has_the_right_size_and_isnt_empty() {
+        for size in [16, 22, 64] {
+            let data = super::icon(size, 0.6);
+            assert_eq!(data.len(), (size * size * 4) as usize);
+            assert!(data.chunks(4).any(|px| px[0] == 255), "some pixels are opaque");
+            assert!(data.chunks(4).any(|px| px[0] == 0), "corners are transparent");
+        }
     }
 }
