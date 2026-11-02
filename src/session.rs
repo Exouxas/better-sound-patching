@@ -496,5 +496,18 @@ fn install_desktop_entry(bin: &Path) -> Result<()> {
          Categories=AudioVideo;Audio;Mixer;\n",
         bin.display()
     );
-    model::write_atomic(&dir.join("better-sound-patching.desktop"), &entry)
+    model::write_atomic(&dir.join("better-sound-patching.desktop"), &entry)?;
+    icons_changed();
+    Ok(())
+}
+
+/// Tell running KDE programs (the taskbar, the menu) to look for icons again. They scan icon
+/// folders once at start, so an icon put in a folder that didn't exist yet stays invisible
+/// (a blank page in the taskbar) until the next login otherwise.
+fn icons_changed() {
+    let sent = zbus::blocking::Connection::session()
+        .and_then(|c| c.emit_signal(None::<&str>, "/KIconLoader", "org.kde.KIconLoader", "iconChanged", &(0i32,)));
+    if let Err(e) = sent {
+        log::debug!("couldn't ask the desktop to reload icons: {e}");
+    }
 }
