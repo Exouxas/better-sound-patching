@@ -84,7 +84,7 @@ impl ksni::Tray for Tray {
 
     /// Click: close the editor if it's open, else open it.
     fn activate(&mut self, _x: i32, _y: i32) {
-        if !crate::gui::single::ask(crate::gui::single::Ask::Close) {
+        if crate::gui::single::ask(crate::gui::single::Ask::Close) == crate::gui::single::Answer::Nobody {
             open();
         }
     }
@@ -107,7 +107,7 @@ impl ksni::Tray for Tray {
                 label: "Open editor".into(),
                 icon_name: "audio-card".into(),
                 activate: Box::new(|_: &mut Self| {
-                    if !crate::gui::single::ask(crate::gui::single::Ask::Show) {
+                    if crate::gui::single::ask(crate::gui::single::Ask::Show) != crate::gui::single::Answer::Done {
                         open();
                     }
                 }),

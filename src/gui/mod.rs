@@ -50,11 +50,14 @@ pub fn run() -> Result<()> {
     } else {
         match single::claim() {
             Some(l) => Some(l),
-            None => {
-                single::ask(single::Ask::Show);
-                println!("The editor is already open.");
-                return Ok(());
-            }
+            None => match single::ask(single::Ask::Show) {
+                single::Answer::Done => {
+                    println!("The editor is already open.");
+                    return Ok(());
+                }
+                // It closed (it was asleep) or just went away: be the editor instead.
+                _ => single::claim(),
+            },
         }
     };
     let options = eframe::NativeOptions {
@@ -67,7 +70,7 @@ pub fn run() -> Result<()> {
     };
     eframe::run_native("Better Sound Patching", options, Box::new(move |cc| {
         let mut app = App::new(cc);
-        app.requests = listener.map(|l| single::serve(l, cc.egui_ctx.clone()));
+        app.requests = listener.map(|l| single::serve(l, cc.egui_ctx.clone(), app.leaving.clone()));
         Ok(Box::new(app))
     }))
         .map_err(|e| anyhow!("{e}"))
@@ -127,7 +130,9 @@ struct App {
     draft_written: Option<Graph>,
     draft_at: Instant,
     /// Requests from other programs (the tray icon, a second editor).
-    requests: Option<std::sync::mpsc::Receiver<single::Ask>>,
+    requests: Option<std::sync::mpsc::Receiver<single::Request>>,
+    /// What closing must keep, for when the editor is closed while asleep (see `single`).
+    leaving: Arc<Mutex<single::Leaving>>,
 }
 
 fn spawn_observer(ctx: egui::Context, live: Arc<Mutex<Live>>) -> pipewire::channel::Sender<Cmd> {
@@ -289,6 +294,7 @@ impl App {
             previewing: false,
             _engine: engine,
             requests: None,
+            leaving: Default::default(),
             draft_written: None,
             draft_at: Instant::now(),
         };
@@ -380,8 +386,9 @@ impl App {
 
     /// Come forward, or close, when the tray icon or another editor asks.
     fn answer_requests(&mut self, ctx: &egui::Context) {
-        let asks: Vec<single::Ask> = self.requests.as_ref().map(|r| r.try_iter().collect()).unwrap_or_default();
-        for ask in asks {
+        let asks: Vec<single::Request> = self.requests.as_ref().map(|r| r.try_iter().collect()).unwrap_or_default();
+        for (ask, done) in asks {
+            let _ = done.send(());
             match ask {
                 // Unsaved changes are kept (see `keep_draft`), so closing loses nothing.
                 single::Ask::Close => ctx.send_viewport_cmd(egui::ViewportCommand::Close),
@@ -395,6 +402,18 @@ impl App {
 
     /// Keep unsaved changes in the draft file (a second after the last edit, and on close),
     /// and remove it once there are none.
+    fn update_leaving(&self) {
+        if self.requests.is_none() {
+            return;
+        }
+        let current = self.current();
+        let now = single::Leaving { unsaved: (current != self.saved).then_some(current), previewing: self.previewing };
+        let mut l = self.leaving.lock().unwrap();
+        if *l != now {
+            *l = now;
+        }
+    }
+
     fn keep_draft(&mut self, now: bool) {
         if std::env::var_os("BSP_SCREENSHOT").is_some() {
             return;
@@ -987,6 +1006,7 @@ impl eframe::App for App {
         let ctx = ui.ctx().clone();
         self.answer_requests(&ctx);
         self.keep_draft(false);
+        self.update_leaving();
         if ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::S)) {
             self.save();
         }
