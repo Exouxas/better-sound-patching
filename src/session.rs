@@ -162,6 +162,23 @@ fn launch_detached(cmd: &[String]) -> Result<()> {
     Ok(())
 }
 
+/// Open the editor as its own program. Started through systemd when possible, so it isn't
+/// part of the daemon's service and keeps running if the daemon restarts.
+pub fn open_editor() -> Result<()> {
+    let exe = std::env::current_exe()?.to_string_lossy().into_owned();
+    let via_systemd = Command::new("systemd-run")
+        .args(["--user", "--collect", "--quiet", "--unit"])
+        .arg(format!("better-sound-patching-editor-{}", std::process::id() ^ (std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().subsec_nanos())))
+        .args([exe.as_str(), "gui"])
+        .stdin(Stdio::null())
+        .status()
+        .is_ok_and(|s| s.success());
+    if !via_systemd {
+        launch_detached(&[exe, "gui".into()])?;
+    }
+    Ok(())
+}
+
 pub fn pause_apps(names: &[String]) -> Vec<PausedApp> {
     let mut paused = Vec::new();
     for name in names {
@@ -256,6 +273,10 @@ pub fn run_daemon(pause: &[String]) -> Result<()> {
     let (tx, rx) = pipewire::channel::channel::<Cmd>();
     // Test daemons never grab global shortcuts.
     let hotkeys = std::env::var_os("BSP_TEST_KEEP_HARDWARE").is_none().then(|| crate::hotkeys::spawn(tx.clone()));
+    // Nor a tray icon.
+    let tray = (std::env::var_os("BSP_TEST_KEEP_HARDWARE").is_none() || std::env::var_os("BSP_TEST_TRAY").is_some())
+        .then(|| crate::tray::spawn(tx.clone()))
+        .flatten();
 
     std::thread::spawn(move || {
         for conn in listener.incoming().flatten() {
@@ -291,6 +312,7 @@ pub fn run_daemon(pause: &[String]) -> Result<()> {
             on_snapshot: Box::new(|_| {}),
             paused: paused.iter().map(|p| p.name.clone()).collect(),
             hotkeys,
+            on_master: tray.map(|h| Box::new(move |m: f32| crate::tray::show_master(&h, m)) as Box<dyn Fn(f32)>),
         },
         rx,
     );

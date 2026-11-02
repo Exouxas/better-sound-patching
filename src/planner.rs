@@ -4,7 +4,7 @@
 //! This module is pure: no PipeWire calls, so it is fully unit-testable.
 
 use crate::live::{Dir, Live, LivePort};
-use crate::model::{BusSpec, FilterSpec, Graph, NodeKind, Selections};
+use crate::model::{BusKind, BusSpec, Channels, FilterSpec, Graph, GraphNode, NodeKind, Selections, VolumeSpec, Wire};
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 
 /// (output port id, input port id)
@@ -163,6 +163,38 @@ pub fn map_channels(outs: &[&LivePort], ins: &[&LivePort]) -> Vec<PortPair> {
         pairs = outs.iter().enumerate().map(|(k, o)| (o.id, ins[k % ins.len()].id)).collect();
     }
     pairs
+}
+
+/// Name of the hidden gain stage after a virtual output.
+pub fn master_name(bus: &str) -> String {
+    format!("master-{bus}")
+}
+
+/// The graph with the master volume in it: a hidden Volume stage right after every virtual
+/// output that feeds anything, so everything played into the virtual outputs gets one gain.
+/// The stages are always there (even at 100%), so changing the master only retunes them.
+pub fn with_master(g: &Graph, gain: f32) -> Graph {
+    let mut out = g.clone();
+    let mut next = g.nodes.iter().map(|n| n.id).max().unwrap_or(0) + 1;
+    for n in &g.nodes {
+        let NodeKind::Bus(b) = &n.kind else { continue };
+        if b.kind != BusKind::Playback || !g.wires.iter().any(|w| w.from == n.id) {
+            continue;
+        }
+        let id = next;
+        next += 1;
+        let channels = if b.channels == Channels::Mono { Channels::Mono } else { Channels::Stereo };
+        out.nodes.push(GraphNode {
+            id,
+            pos: n.pos,
+            kind: NodeKind::Volume(VolumeSpec { name: master_name(&b.name), channels, gain }),
+        });
+        for w in out.wires.iter_mut().filter(|w| w.from == n.id) {
+            w.from = id;
+        }
+        out.wires.push(Wire { from: n.id, to: id, from_pin: 0, to_pin: 0 });
+    }
+    out
 }
 
 pub fn plan(profile: &Graph, live: &Live, selected: &Selections) -> Plan {
@@ -528,6 +560,27 @@ mod tests {
         // Discord's playback leaves system-in; its recording and Firefox are untouched.
         assert_eq!(plan.remove, vec![wp_play]);
         let _ = (wp_rec, ff);
+    }
+
+    #[test]
+    fn master_gain_sits_after_every_virtual_output_that_feeds_something() {
+        let wire = |from, to| Wire { from, to, from_pin: 0, to_pin: 0 };
+        let g = Graph {
+            nodes: vec![
+                n(1, bus("system-in", BusKind::Playback, Channels::Stereo)),
+                n(2, bus("unused", BusKind::Playback, Channels::Stereo)),
+                n(3, bus("system-out", BusKind::Microphone, Channels::Mono)),
+                n(4, NodeKind::Output { device: dev("hw") }),
+                n(5, NodeKind::Input { device: dev("mic") }),
+            ],
+            wires: vec![wire(1, 4), wire(5, 3)],
+        };
+        let m = with_master(&g, 0.5);
+        let stage = m.nodes.iter().find(|n| matches!(&n.kind, NodeKind::Volume(v) if v.name == "master-system-in" && v.gain == 0.5)).unwrap();
+        assert_eq!(m.nodes.len(), 6, "one stage: not for the unused output or the mic");
+        assert!(m.wires.contains(&wire(1, stage.id)) && m.wires.contains(&wire(stage.id, 4)));
+        assert!(!m.wires.contains(&wire(1, 4)));
+        assert!(m.wires.contains(&wire(5, 3)));
     }
 
     #[test]

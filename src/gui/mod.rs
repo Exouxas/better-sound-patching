@@ -76,6 +76,8 @@ struct App {
     /// Switch selections as last clicked here, and when (shown until the daemon catches up).
     selected: Selections,
     selected_at: Option<Instant>,
+    /// Master volume as last set here, and when (shown until the daemon catches up).
+    master_set: Option<(f32, Instant)>,
     /// Signal levels of processing nodes, refreshed ~25 times a second while any are shown.
     readings: Arc<Mutex<BTreeMap<String, Reading>>>,
     want_levels: Arc<AtomicBool>,
@@ -107,6 +109,7 @@ fn spawn_observer(ctx: egui::Context, live: Arc<Mutex<Live>>) -> pipewire::chann
             }),
             paused: vec![],
             hotkeys: None,
+            on_master: None,
         };
         if let Err(e) = engine::run(cfg, rx) {
             log::error!("observer stopped: {e:#}");
@@ -237,6 +240,7 @@ impl App {
             saved: Graph::default(),
             selected: model::load_state().selected,
             selected_at: None,
+            master_set: None,
             readings,
             want_levels,
             fit_pending: true,
@@ -584,6 +588,8 @@ impl App {
     fn mixer(&mut self, ui: &mut egui::Ui, live: &Live) {
         ui.heading("Mixer");
         ui.add_space(4.0);
+        self.master_strip(ui);
+        ui.separator();
         let profile = self.current();
         let mut strips: Vec<(u32, String, &'static str)> = vec![];
         for n in &profile.nodes {
@@ -617,6 +623,45 @@ impl App {
                 self.strip(ui, *id, &format!("{icon} {name}"), &vols);
             }
         });
+    }
+
+    /// Master volume: one gain on everything leaving the virtual outputs. Also on the tray
+    /// icon (scroll over it).
+    fn master_strip(&mut self, ui: &mut egui::Ui) {
+        let status = self.daemon.lock().unwrap().status.clone();
+        let mut v = match self.master_set {
+            Some((v, t)) if t.elapsed() < Duration::from_millis(1500) => v,
+            _ => status.as_ref().map_or_else(|| model::load_state().master, |s| s.master),
+        };
+        ui.label(RichText::new("Master").strong())
+            .on_hover_text("Turns everything played into the virtual outputs up or down together. Scroll over the tray icon to change it too.");
+        let r = ui.horizontal(|ui| {
+            ui.spacing_mut().slider_width = 150.0;
+            let mut pct = v * 100.0;
+            let r = ui.add(egui::Slider::new(&mut pct, 0.0..=100.0).step_by(1.0).suffix("%").max_decimals(0));
+            if r.changed() {
+                v = pct / 100.0;
+            }
+            r.changed()
+        });
+        if !r.inner {
+            return;
+        }
+        self.master_set = Some((v, Instant::now()));
+        if status.is_some() {
+            let toast = self.toast.clone();
+            std::thread::spawn(move || {
+                if let Ok(Response::Error(e)) | Err(e) = ipc::request(&Request::Master { volume: v }).map_err(|e| format!("{e:#}")) {
+                    *toast.lock().unwrap() = Some((e, true, Instant::now()));
+                }
+            });
+        } else {
+            let mut state = model::load_state();
+            state.master = v;
+            if let Err(e) = model::save_state(&state) {
+                self.notify(format!("{e:#}"), true);
+            }
+        }
     }
 
     fn strip(&mut self, ui: &mut egui::Ui, id: u32, label: &str, vols: &HashMap<u32, (f32, bool)>) {

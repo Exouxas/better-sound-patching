@@ -23,6 +23,8 @@ pub enum Request {
     /// Replace these virtual devices (made elsewhere, e.g. by your PipeWire config, which the
     /// caller has already moved aside) with our own of the same name.
     TakeOver { names: Vec<String> },
+    /// Set the master volume (0..=1): a gain on everything leaving the virtual outputs.
+    Master { volume: f32 },
     /// Stop the daemon. Its links and buses disappear with it.
     Stop { restore_paused: bool },
 }
@@ -42,6 +44,13 @@ pub struct Status {
     #[serde(default)]
     pub filters_running: Vec<String>,
     pub last_error: Option<String>,
+    /// Master volume (0..=1).
+    #[serde(default = "one")]
+    pub master: f32,
+}
+
+fn one() -> f32 {
+    1.0
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

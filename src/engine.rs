@@ -47,6 +47,8 @@ pub struct EngineConfig {
     pub paused: Vec<String>,
     /// Told the set of switch shortcut keys whenever it changes.
     pub hotkeys: Option<mpsc::Sender<BTreeSet<String>>>,
+    /// Told the master volume whenever it changes (e.g. to update the tray icon).
+    pub on_master: Option<Box<dyn Fn(f32)>>,
 }
 
 pub struct ExitInfo {
@@ -110,6 +112,7 @@ struct State {
     fatal: Option<String>,
     hotkeys: Option<mpsc::Sender<BTreeSet<String>>>,
     keys_sent: Option<BTreeSet<String>>,
+    master: f32,
 }
 
 fn parse_u32(props: &pw::spa::utils::dict::DictRef, key: &str) -> Option<u32> {
@@ -396,7 +399,7 @@ fn reconcile(st: &mut State, core: &pw::core::CoreRc, registry: &pw::registry::R
         let _ = tx.send(keys.clone());
         st.keys_sent = Some(keys);
     }
-    let mut plan = planner::plan(&profile, &st.live, &st.selected);
+    let mut plan = planner::plan(&planner::with_master(&profile, st.master), &st.live, &st.selected);
     if test_mode() {
         let hw = |id: u32| st.live.nodes.get(&id).is_some_and(|n| n.is_hardware());
         plan.remove.retain(|id| st.live.links.get(id).is_none_or(|l| !hw(l.out_node) && !hw(l.in_node)));
@@ -556,6 +559,7 @@ fn status(st: &State, cfg_paused: &[String]) -> Status {
             v
         },
         last_error: st.last_error.clone(),
+        master: st.master,
     }
 }
 
@@ -569,6 +573,7 @@ fn load_graph(st: &mut State) -> Result<()> {
 fn save_selected(st: &State) {
     let mut state = model::load_state();
     state.selected = st.selected.clone();
+    state.master = st.master;
     if let Err(e) = model::save_state(&state) {
         log::warn!("saving selections: {e:#}");
     }
@@ -582,10 +587,15 @@ pub fn run(cfg: EngineConfig, cmd_rx: pw::channel::Receiver<Cmd>) -> Result<Exit
     let core = context.connect_rc(None)?;
     let registry = core.get_registry_rc()?;
 
-    let state = Rc::new(RefCell::new(State { dirty: true, restore_paused: true, hotkeys: cfg.hotkeys.clone(), ..Default::default() }));
+    let state = Rc::new(RefCell::new(State { dirty: true, restore_paused: true, hotkeys: cfg.hotkeys.clone(), master: 1.0, ..Default::default() }));
     if cfg.enforce {
         let mut st = state.borrow_mut();
-        st.selected = model::load_state().selected;
+        let saved = model::load_state();
+        st.selected = saved.selected;
+        st.master = saved.master.clamp(0.0, 1.0);
+        if let Some(f) = &cfg.on_master {
+            f(st.master);
+        }
         if !model::graph_exists() {
             log::warn!("no routing graph yet; nothing will be routed until you save one");
         } else if let Err(e) = load_graph(&mut st) {
@@ -648,6 +658,7 @@ pub fn run(cfg: EngineConfig, cmd_rx: pw::channel::Receiver<Cmd>) -> Result<Exit
 
     let enforce = cfg.enforce;
     let paused = cfg.paused.clone();
+    let on_master = cfg.on_master;
     let _cmd = {
         let state = state.clone();
         let core_for_cmd = core.clone();
@@ -710,6 +721,16 @@ pub fn run(cfg: EngineConfig, cmd_rx: pw::channel::Receiver<Cmd>) -> Result<Exit
                             Response::Ok
                         }
                         Request::TakeOver { .. } => Response::Error("not enforcing".into()),
+                        Request::Master { volume } if enforce => {
+                            st.master = volume.clamp(0.0, 1.0);
+                            save_selected(&st);
+                            reconcile(&mut st, &core_for_cmd, &registry_for_cmd);
+                            if let Some(f) = &on_master {
+                                f(st.master);
+                            }
+                            Response::Ok
+                        }
+                        Request::Master { .. } => Response::Error("not enforcing".into()),
                         Request::Stop { restore_paused } => {
                             st.restore_paused = restore_paused;
                             if let Some(ml) = ml.upgrade() {

@@ -9,6 +9,7 @@ mod model;
 mod planner;
 mod session;
 mod takeover;
+mod tray;
 
 use anyhow::{Result, bail};
 use clap::{Parser, Subcommand};
@@ -154,6 +155,7 @@ fn snapshot() -> Result<live::Live> {
             }),
             paused: vec![],
             hotkeys: None,
+            on_master: None,
         };
         let _ = engine::run(cfg, crx);
     });

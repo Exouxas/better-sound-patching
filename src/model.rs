@@ -344,11 +344,24 @@ pub struct Graph {
 
 
 /// Runtime choices that aren't part of the graph's design: which pin each switch uses.
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AppState {
     /// Switch name -> selected pin (0-based). Switches not listed use their first pin.
     #[serde(default)]
     pub selected: Selections,
+    /// Master volume: a gain on everything leaving the virtual outputs (0..=1).
+    #[serde(default = "full")]
+    pub master: f32,
+}
+
+fn full() -> f32 {
+    1.0
+}
+
+impl Default for AppState {
+    fn default() -> Self {
+        AppState { selected: Selections::default(), master: 1.0 }
+    }
 }
 
 pub type Selections = std::collections::BTreeMap<String, u32>;
