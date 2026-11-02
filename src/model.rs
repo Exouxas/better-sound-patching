@@ -366,6 +366,25 @@ impl Default for AppState {
 
 pub type Selections = std::collections::BTreeMap<String, u32>;
 
+/// The same switch choices, for when `from` (e.g. unsaved edits that moved pins around) gives
+/// way to `to` (e.g. the saved graph): each switch keeps using the same pin, found by its
+/// label and key, wherever that pin sits in `to`. Returns only the switches whose number changes.
+pub fn follow_selection(from: &Graph, to: &Graph, selected: &Selections) -> Vec<(String, u32)> {
+    let mut out = vec![];
+    for n in &from.nodes {
+        let Some((name, pins)) = n.kind.switch() else { continue };
+        let s = selected.get(name).copied().unwrap_or(0);
+        let Some(pin) = pins.get(s as usize) else { continue };
+        let Some((_, to_pins)) = to.nodes.iter().filter_map(|m| m.kind.switch()).find(|(m, _)| *m == name) else { continue };
+        let same: Vec<u32> = (0..to_pins.len() as u32).filter(|&j| to_pins[j as usize] == *pin).collect();
+        let Some(&j) = same.iter().find(|&&j| j == s).or(same.first()) else { continue };
+        if j != s {
+            out.push((name.to_owned(), j));
+        }
+    }
+    out
+}
+
 pub fn config_dir() -> PathBuf {
     dirs::config_dir()
         .unwrap_or_else(|| PathBuf::from("~/.config"))
@@ -522,5 +541,29 @@ mod tests {
         let text = toml::to_string_pretty(&p).unwrap();
         let back: Graph = toml::from_str(&text).unwrap();
         assert_eq!(p, back);
+    }
+
+    #[test]
+    fn switches_keep_their_pin_when_pins_are_renumbered() {
+        let switch = |labels: &[&str]| Graph {
+            nodes: vec![GraphNode {
+                id: 0,
+                pos: [0.0, 0.0],
+                kind: NodeKind::SwitchOutput {
+                    name: "Output".into(),
+                    pins: labels.iter().map(|l| SwitchPin { label: (*l).into(), key: String::new() }).collect(),
+                },
+            }],
+            wires: vec![],
+        };
+        let saved = switch(&["Headset", "Speakers", "Index"]);
+        let moved = switch(&["Speakers", "Index", "Headset"]);
+        let on_headset: Selections = [("Output".to_string(), 0)].into();
+        // Headset moved to 3: the switch follows it there, and back again on undo.
+        assert_eq!(follow_selection(&saved, &moved, &on_headset), [("Output".to_string(), 2)]);
+        let on_moved_headset: Selections = [("Output".to_string(), 2)].into();
+        assert_eq!(follow_selection(&moved, &saved, &on_moved_headset), [("Output".to_string(), 0)]);
+        // A renamed pin can't be followed: the number stays.
+        assert!(follow_selection(&saved, &switch(&["Phones", "Speakers", "Index"]), &on_headset).is_empty());
     }
 }

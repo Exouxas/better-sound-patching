@@ -564,9 +564,25 @@ fn status(st: &State, cfg_paused: &[String]) -> Status {
 }
 
 fn load_graph(st: &mut State) -> Result<()> {
-    st.profile = Some(model::load_graph()?);
+    set_profile(st, model::load_graph()?);
     st.dirty = true;
     Ok(())
+}
+
+/// Run `graph` from now on. Switches keep using the same pins even if the new graph has them
+/// at other numbers (pins reordered in the editor, or such a reorder undone).
+fn set_profile(st: &mut State, graph: Graph) {
+    if let Some(old) = &st.profile {
+        let moved = model::follow_selection(old, &graph, &st.selected);
+        if !moved.is_empty() {
+            for (switch, pin) in moved {
+                log::info!("{switch} -> pin {} (same pin, new number)", pin + 1);
+                st.selected.insert(switch, pin);
+            }
+            save_selected(st);
+        }
+    }
+    st.profile = Some(graph);
 }
 
 /// Remember selections across restarts.
@@ -706,7 +722,7 @@ pub fn run(cfg: EngineConfig, cmd_rx: pw::channel::Receiver<Cmd>) -> Result<Exit
                         Request::Select { .. } | Request::Key { .. } => Response::Error("not enforcing".into()),
                         Request::Levels => Response::Levels(st.filters.iter().map(|(k, f)| (k.clone(), f.reading())).collect()),
                         Request::Preview { profile } if enforce => {
-                            st.profile = Some(profile);
+                            set_profile(&mut st, profile);
                             // Apply right away rather than on the next tick: this is what makes
                             // dragging an EQ band or a wire feel immediate.
                             reconcile(&mut st, &core_for_cmd, &registry_for_cmd);

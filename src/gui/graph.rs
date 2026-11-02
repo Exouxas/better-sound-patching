@@ -67,6 +67,9 @@ pub struct Viewer<'a> {
     pub owned_buses: &'a [String],
     /// A switch pin the user clicked this frame: (switch name, pin).
     pub select: Option<(String, u32)>,
+    /// A switch whose pin in use got a new number this frame (pins moved): show it there
+    /// right away. Nothing is sent; the daemon follows the pin by itself.
+    pub renumbered: Option<(String, u32)>,
     /// Set to the graph area to zoom and pan so every node fits in it (once).
     pub fit_to: Option<Rect>,
     /// Set to the graph-to-screen transform used this frame.
@@ -192,32 +195,139 @@ impl Viewer<'_> {
     }
 
     /// A switch: pick which pin is live, name the pins, and give them keyboard shortcuts.
-    fn switch_editor(&mut self, ui: &mut Ui, node: NodeId, name: &str, pins: &mut Vec<SwitchPin>, outputs: bool, dropped: &mut Vec<(bool, usize)>) {
+    /// `moved` is set when pins were reordered or removed: old pin index -> new index (`None` = removed).
+    fn switch_editor(&mut self, ui: &mut Ui, node: NodeId, name: &str, pins: &mut Vec<SwitchPin>, outputs: bool, moved: &mut Option<Vec<Option<usize>>>) {
         let active = self.active_slots.get(&(node.0 as u32)).copied().flatten();
         ui.label(RichText::new(if outputs { "Click a number to send audio there." } else { "Click a number to use that input." }).small().weak());
-        for (k, pin) in pins.iter_mut().enumerate() {
-            ui.horizontal(|ui| {
-                let on = active == Some(k as u32);
-                let text = RichText::new(format!(" {} ", k + 1)).strong().color(if on { Color32::BLACK } else { GREY });
-                let b = egui::Button::new(text).fill(if on { GREEN } else { Color32::from_gray(40) });
-                if ui.add(b).on_hover_text("Use this pin").clicked() && !on {
-                    self.select = Some((name.to_owned(), k as u32));
-                }
-                self.changed |= ui.add(egui::TextEdit::singleline(&mut pin.label).hint_text("label").desired_width(90.0)).changed();
-                self.changed |= key_field(ui, (node, k), &mut pin.key);
-            });
+        let n = pins.len();
+        let mut op = None;
+        // Rows sit at animated heights so a dragged row can follow the pointer while the
+        // others slide out of its way.
+        let anim_id = egui::Id::new(("pin-rows", node));
+        let mut anim: RowAnim = ui.data(|d| d.get_temp(anim_id)).unwrap_or_default();
+        let row_h = anim.row_h.max(16.0);
+        let gap = ui.spacing().item_spacing.y;
+        let step = row_h + gap;
+        let slot_y = |slot: usize| slot as f32 * step;
+        if anim.y.len() != n {
+            anim.y = (0..n).map(slot_y).collect();
+            anim.drag = None;
         }
-        ui.horizontal(|ui| {
-            if pins.len() < 8 && ui.small_button("+ pin").clicked() {
-                pins.push(SwitchPin::default());
-                self.changed = true;
-            }
-            if pins.len() > 1 && ui.small_button("− pin").on_hover_text("Remove the last pin (and its wires)").clicked() {
-                pins.pop();
-                dropped.push((outputs, pins.len()));
-                self.changed = true;
-            }
+        let top = ui.cursor().top();
+        let (left, width) = (ui.cursor().left(), ui.available_width());
+        let pointer = ui.ctx().pointer_latest_pos().map(|p| {
+            let local = ui.ctx().layer_transform_from_global(ui.layer_id()).map_or(p, |t| t * p);
+            local.y - top
         });
+        // Where the dragged row is now, and the slot it would drop into.
+        let held = anim.drag.and_then(|(from, grab)| {
+            let y = (pointer? - grab).clamp(0.0, slot_y(n - 1));
+            Some((from, y, ((y / step).round() as usize).min(n - 1)))
+        });
+        let dt = ui.input(|i| i.stable_dt).min(0.1);
+        let ease = 1.0 - (-dt * 18.0).exp();
+        let mut moving = false;
+        for k in 0..n {
+            let target = match held {
+                Some((from, y, _)) if k == from => y,
+                Some((from, _, to)) => {
+                    // Its place in the list with the dragged row taken out and put back at `to`.
+                    let without = if k > from { k - 1 } else { k };
+                    slot_y(if without >= to { without + 1 } else { without })
+                }
+                None => slot_y(k),
+            };
+            if held.is_some_and(|(from, ..)| from == k) {
+                anim.y[k] = target;
+            } else {
+                anim.y[k] += (target - anim.y[k]) * ease;
+                if (target - anim.y[k]).abs() < 0.3 {
+                    anim.y[k] = target;
+                } else {
+                    moving = true;
+                }
+            }
+        }
+        // Draw the dragged row last, so it is on top.
+        let mut order: Vec<usize> = (0..n).collect();
+        if let Some((from, ..)) = held {
+            order.retain(|&k| k != from);
+            order.push(from);
+        }
+        let mut still_held = false;
+        let mut tallest: f32 = 0.0;
+        for k in order {
+            let rect = egui::Rect::from_min_size(egui::pos2(left, top + anim.y[k]), vec2(width, row_h));
+            let mut row = ui.new_child(egui::UiBuilder::new().id_salt(("pin-row", k)).max_rect(rect).layout(egui::Layout::left_to_right(egui::Align::Center)));
+            let lifted = held.is_some_and(|(from, ..)| from == k);
+            if lifted {
+                let bg = rect.expand2(vec2(3.0, 1.0));
+                row.painter().rect(bg, 4.0, Color32::from_gray(48), egui::Stroke::new(1.0, Color32::from_gray(80)), egui::StrokeKind::Outside);
+            }
+            let handle = drag_handle(&mut row, egui::Id::new(("pin-handle", node, k)), n > 1);
+            if handle.drag_started()
+                && let Some(p) = pointer
+            {
+                anim.drag = Some((k, p - anim.y[k]));
+            }
+            if lifted {
+                if handle.dragged() {
+                    still_held = true;
+                } else if let Some((from, _, to)) = held
+                    && to != from
+                {
+                    op = Some(PinOp::Move(from, to));
+                }
+            }
+            let on = active == Some(k as u32);
+            let text = RichText::new(format!(" {} ", k + 1)).strong().color(if on { Color32::BLACK } else { GREY });
+            let b = egui::Button::new(text).fill(if on { GREEN } else { Color32::from_gray(40) });
+            if row.add(b).on_hover_text("Use this pin").clicked() && !on {
+                self.select = Some((name.to_owned(), k as u32));
+            }
+            let pin = &mut pins[k];
+            self.changed |= row.add(egui::TextEdit::singleline(&mut pin.label).hint_text("label").desired_width(80.0)).changed();
+            self.changed |= key_field(&mut row, (node, k), &mut pin.key);
+            if row.add_enabled(n > 1, egui::Button::new("×").small()).on_hover_text("Remove this pin (and its wires)").clicked() {
+                op = Some(PinOp::Remove(k));
+            }
+            tallest = tallest.max(row.min_rect().height());
+        }
+        if held.is_some() && !still_held {
+            anim.drag = None;
+        }
+        if held.is_some() || moving {
+            ui.ctx().request_repaint();
+        }
+        anim.row_h = tallest.max(16.0);
+        ui.allocate_rect(egui::Rect::from_min_size(egui::pos2(left, top), vec2(width, slot_y(n) - gap)), egui::Sense::hover());
+        if n < 8 && ui.small_button("+ pin").clicked() {
+            pins.push(SwitchPin::default());
+            self.changed = true;
+        }
+        if let Some(op) = op {
+            // The daemon keeps the switch on the same pin at its new number when the change
+            // reaches it (see `model::follow_selection`).
+            let map = op.apply(pins);
+            if let Some(Some(now)) = active.and_then(|a| map.get(a as usize).copied())
+                && Some(now as u32) != active
+            {
+                self.renumbered = Some((name.to_owned(), now as u32));
+            }
+            // Rows start from where they are on screen and glide to their new places.
+            let mut y = vec![0.0; pins.len()];
+            for (old, new) in map.iter().enumerate() {
+                if let Some(new) = *new {
+                    y[new] = anim.y[old];
+                }
+            }
+            anim.y = y;
+            anim.drag = None;
+            ui.ctx().request_repaint();
+            *moved = Some(map);
+            self.changed = true;
+        }
+        ui.data_mut(|d| d.insert_temp(anim_id, anim));
         ui.label(RichText::new("Pins on different switches with the same key switch together.").small().weak());
     }
 
@@ -267,6 +377,90 @@ impl Viewer<'_> {
                 ui.label(RichText::new("⚠ not plugged in — waiting for it").color(AMBER).small());
             }
         }
+    }
+}
+
+/// A change to a switch's list of pins.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum PinOp {
+    /// Take the pin at `.0` out and put it back so it ends up at `.1`.
+    Move(usize, usize),
+    Remove(usize),
+}
+
+impl PinOp {
+    /// Change `pins`; returns where each old pin went (`None` = removed).
+    fn apply<T>(self, pins: &mut Vec<T>) -> Vec<Option<usize>> {
+        let mut order: Vec<usize> = (0..pins.len()).collect();
+        let mut taken: Vec<Option<T>> = pins.drain(..).map(Some).collect();
+        match self {
+            PinOp::Move(from, to) => {
+                let k = order.remove(from);
+                order.insert(to.min(order.len()), k);
+            }
+            PinOp::Remove(k) => {
+                order.remove(k);
+            }
+        }
+        let mut map = vec![None; taken.len()];
+        for (new, &old) in order.iter().enumerate() {
+            map[old] = Some(new);
+            pins.push(taken[old].take().unwrap());
+        }
+        map
+    }
+}
+
+/// Where a switch's pin rows are drawn (relative to the first row), for animating reorders.
+#[derive(Clone, Default)]
+struct RowAnim {
+    /// Current height of each row, by pin.
+    y: Vec<f32>,
+    /// The pin being dragged, and where on its row it was grabbed.
+    drag: Option<(usize, f32)>,
+    /// Height of one row, measured last frame.
+    row_h: f32,
+}
+
+/// Six dots, the usual sign for "grab here to move".
+/// `id` must stay the same while the row moves (widgets' automatic ids depend on drawing order).
+fn drag_handle(ui: &mut Ui, id: egui::Id, enabled: bool) -> egui::Response {
+    let sense = if enabled { egui::Sense::drag() } else { egui::Sense::hover() };
+    let (rect, _) = ui.allocate_exact_size(vec2(12.0, 20.0), egui::Sense::hover());
+    let mut r = ui.interact(rect, id, sense);
+    if enabled {
+        r = r.on_hover_cursor(egui::CursorIcon::Grab).on_hover_text("Drag to reorder");
+    }
+    let dragging = r.dragged();
+    if dragging {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::Grabbing);
+    }
+    let color = if !enabled { Color32::from_gray(45) } else if dragging || r.hovered() { Color32::from_gray(170) } else { Color32::from_gray(85) };
+    for col in [-2.0, 2.0] {
+        for row in [-4.0, 0.0, 4.0] {
+            ui.painter().circle_filled(rect.center() + vec2(col, row), 1.1, color);
+        }
+    }
+    r
+}
+
+/// Move a switch's wires along with its pins (`map`: old pin -> new pin, `None` = removed).
+/// A switch's pins are on one side only (outputs on an output switch, inputs on an input
+/// switch); its single pin on the other side keeps its wires.
+fn follow_pins(snarl: &mut Snarl<NodeKind>, node: NodeId, map: &[Option<usize>]) {
+    let outputs = matches!(snarl.get_node(node), Some(NodeKind::SwitchOutput { .. }));
+    let wires: Vec<(OutPinId, InPinId)> = snarl
+        .wires()
+        .filter(|(o, i)| if outputs { o.node == node } else { i.node == node })
+        .collect();
+    for &(o, i) in &wires {
+        snarl.disconnect(o, i);
+    }
+    for (mut o, mut i) in wires {
+        let pin = if outputs { &mut o.output } else { &mut i.input };
+        let Some(Some(new)) = map.get(*pin).copied() else { continue };
+        *pin = new;
+        snarl.connect(o, i);
     }
 }
 
@@ -402,8 +596,8 @@ impl SnarlViewer<NodeKind> for Viewer<'_> {
     }
 
     fn show_body(&mut self, node: NodeId, _i: &[InPin], _o: &[OutPin], ui: &mut Ui, snarl: &mut Snarl<NodeKind>) {
-        // Pins removed this frame: (is output, index). Their wires are dropped after the match.
-        let mut dropped_pins: Vec<(bool, usize)> = vec![];
+        // Pins moved or removed this frame (old index -> new). Their wires follow after the match.
+        let mut moved_pins: Option<Vec<Option<usize>>> = None;
         ui.vertical(|ui| {
             ui.set_max_width(260.0);
             match &mut snarl[node] {
@@ -459,8 +653,8 @@ impl SnarlViewer<NodeKind> for Viewer<'_> {
                     let d = self.defaults.1;
                     self.default_note(ui, d, "input");
                 }
-                NodeKind::SwitchOutput { name, pins } => self.switch_editor(ui, node, name, pins, true, &mut dropped_pins),
-                NodeKind::SwitchInput { name, pins } => self.switch_editor(ui, node, name, pins, false, &mut dropped_pins),
+                NodeKind::SwitchOutput { name, pins } => self.switch_editor(ui, node, name, pins, true, &mut moved_pins),
+                NodeKind::SwitchInput { name, pins } => self.switch_editor(ui, node, name, pins, false, &mut moved_pins),
                 NodeKind::Levels(l) => {
                     let reading = self.reading(&l.name);
                     let before = l.clone();
@@ -477,12 +671,8 @@ impl SnarlViewer<NodeKind> for Viewer<'_> {
                 }
             }
         });
-        for (output, k) in dropped_pins {
-            if output {
-                snarl.drop_outputs(OutPinId { node, output: k });
-            } else {
-                snarl.drop_inputs(InPinId { node, input: k });
-            }
+        if let Some(map) = moved_pins {
+            follow_pins(snarl, node, &map);
         }
     }
 
@@ -587,7 +777,8 @@ fn key_field(ui: &mut Ui, id: impl std::hash::Hash + std::fmt::Debug, key: &mut 
     if capturing {
         let pressed = ui.input(|i| {
             i.events.iter().find_map(|e| match e {
-                egui::Event::Key { key, pressed: true, modifiers, .. } => Some((*key, *modifiers)),
+                // Ctrl, Alt etc. on their own come as keys too; wait for the key they go with.
+                egui::Event::Key { key, pressed: true, modifiers, .. } if !is_modifier(*key) => Some((*key, *modifiers)),
                 _ => None,
             })
         });
@@ -627,10 +818,21 @@ fn key_field(ui: &mut Ui, id: impl std::hash::Hash + std::fmt::Debug, key: &mut 
     } else {
         RichText::new(key.as_str())
     };
-    if ui.small_button(text).on_hover_text("Shortcut that selects this pin. Esc cancels, Backspace clears.").clicked() {
+    let button = ui.add(egui::Button::new(text).small().min_size(egui::vec2(84.0, 0.0))).on_hover_text("Shortcut that selects this pin. Esc cancels, Backspace or right-click clears.");
+    if button.clicked() {
         ui.data_mut(|d| d.insert_temp(id, !capturing));
     }
+    if button.secondary_clicked() {
+        changed |= !key.is_empty();
+        key.clear();
+        ui.data_mut(|d| d.insert_temp(id, false));
+    }
     changed
+}
+
+fn is_modifier(key: egui::Key) -> bool {
+    use egui::Key::*;
+    matches!(key, ShiftLeft | ShiftRight | ControlLeft | ControlRight | AltLeft | AltRight | SuperLeft | SuperRight)
 }
 
 const METER_MIN: f32 = -60.0;
@@ -985,3 +1187,60 @@ fn eq_editor(ui: &mut Ui, node: NodeId, eq: &mut EqSpec) {
     ui.data_mut(|d| d.insert_temp(sel_id, selected));
 }
 
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use egui::pos2;
+
+    fn pins(labels: &[&str]) -> Vec<SwitchPin> {
+        labels.iter().map(|l| SwitchPin { label: (*l).into(), key: String::new() }).collect()
+    }
+
+    /// Where each output pin of `node` is wired to, by pin number.
+    fn targets(snarl: &Snarl<NodeKind>, node: NodeId) -> Vec<(usize, NodeId)> {
+        let mut v: Vec<_> = snarl.wires().filter(|(o, _)| o.node == node).map(|(o, i)| (o.output, i.node)).collect();
+        v.sort();
+        v
+    }
+
+    #[test]
+    fn removing_or_moving_a_switch_pin_renumbers_and_wires_follow() {
+        let mut snarl = Snarl::new();
+        let src = snarl.insert_node(pos2(0.0, 0.0), NodeKind::OtherAppsPlayback);
+        let sw = snarl.insert_node(pos2(0.0, 0.0), NodeKind::SwitchOutput { name: "Out".into(), pins: pins(&["Speakers", "Headset", "Index"]) });
+        let outs: Vec<NodeId> = (0..3).map(|_| snarl.insert_node(pos2(0.0, 0.0), NodeKind::Output { device: None })).collect();
+        snarl.connect(OutPinId { node: src, output: 0 }, InPinId { node: sw, input: 0 });
+        for (k, &o) in outs.iter().enumerate() {
+            snarl.connect(OutPinId { node: sw, output: k }, InPinId { node: o, input: 0 });
+        }
+
+        // Remove Speakers: Headset becomes 1, Index 2, and Speakers' wire goes.
+        let NodeKind::SwitchOutput { pins: p, .. } = &mut snarl[sw] else { unreachable!() };
+        let map = PinOp::Remove(0).apply(p);
+        assert_eq!(p.iter().map(|p| p.label.as_str()).collect::<Vec<_>>(), ["Headset", "Index"]);
+        assert_eq!(map, [None, Some(0), Some(1)]);
+        follow_pins(&mut snarl, sw, &map);
+        assert_eq!(targets(&snarl, sw), [(0, outs[1]), (1, outs[2])]);
+
+        // Move Index up: it becomes 1, and its wire comes along.
+        let NodeKind::SwitchOutput { pins: p, .. } = &mut snarl[sw] else { unreachable!() };
+        let map = PinOp::Move(1, 0).apply(p);
+        assert_eq!(p.iter().map(|p| p.label.as_str()).collect::<Vec<_>>(), ["Index", "Headset"]);
+        follow_pins(&mut snarl, sw, &map);
+        assert_eq!(targets(&snarl, sw), [(0, outs[2]), (1, outs[1])]);
+        // The input side is untouched.
+        assert!(snarl.wires().any(|(o, i)| o.node == src && i.node == sw));
+    }
+
+    #[test]
+    fn moving_a_pin_shifts_the_ones_between() {
+        let mut v = vec!['a', 'b', 'c', 'd'];
+        assert_eq!(PinOp::Move(0, 3).apply(&mut v), [Some(3), Some(0), Some(1), Some(2)]);
+        assert_eq!(v, ['b', 'c', 'd', 'a']);
+        assert_eq!(PinOp::Move(3, 1).apply(&mut v), [Some(0), Some(2), Some(3), Some(1)]);
+        assert_eq!(v, ['b', 'a', 'c', 'd']);
+        assert_eq!(PinOp::Remove(1).apply(&mut v), [Some(0), None, Some(1), Some(2)]);
+        assert_eq!(v, ['b', 'c', 'd']);
+    }
+}

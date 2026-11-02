@@ -456,6 +456,18 @@ impl App {
         }
         match model::save_graph(&graph) {
             Ok(()) => {
+                if self.daemon.lock().unwrap().status.is_none() {
+                    // Nobody is running the graph to follow moved pins: keep the saved choices
+                    // on the same pins here (the daemon does this itself when it runs).
+                    let mut state = model::load_state();
+                    let moved = model::follow_selection(&self.saved, &graph, &state.selected);
+                    if !moved.is_empty() {
+                        state.selected.extend(moved);
+                        if let Err(e) = model::save_state(&state) {
+                            self.notify(format!("{e:#}"), true);
+                        }
+                    }
+                }
                 self.saved = graph;
                 self.preview_sent = None;
                 self.previewing = false;
@@ -1019,6 +1031,7 @@ impl eframe::App for App {
                 running: info.status.is_some(),
                 owned_buses: info.status.as_ref().map_or(&[], |s| s.buses_owned.as_slice()),
                 select: None,
+                renumbered: None,
                 fit_to: std::mem::take(&mut self.fit_pending).then(|| ui.max_rect()),
                 transform: None,
                 defaults: (plan.default_sink, plan.default_source),
@@ -1030,8 +1043,12 @@ impl eframe::App for App {
                 .id(graph_id())
                 .style(self.style)
                 .show(&mut self.snarl, &mut viewer, ui);
-            let (labels_changed, select) = (viewer.labels_changed, viewer.select.take());
+            let (labels_changed, select, viewer_renumbered) = (viewer.labels_changed, viewer.select.take(), viewer.renumbered.take());
             self.graph_transform = viewer.transform.or(self.graph_transform);
+            if let Some((switch, pin)) = viewer_renumbered {
+                self.selected.insert(switch, pin);
+                self.selected_at = Some(Instant::now());
+            }
             if let Some((switch, pin)) = select {
                 self.select(switch, pin);
             }
