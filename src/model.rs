@@ -39,9 +39,19 @@ pub struct BusSpec {
     pub kind: BusKind,
     #[serde(default)]
     pub channels: Channels,
+    /// The name programs and sound settings show (`node.description`); the node name if empty.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub description: String,
 }
 
 impl BusSpec {
+    pub fn new(name: &str, kind: BusKind, channels: Channels) -> BusSpec {
+        BusSpec { name: name.into(), kind, channels, description: String::new() }
+    }
+    /// The name shown to people.
+    pub fn display(&self) -> &str {
+        if self.description.is_empty() { &self.name } else { &self.description }
+    }
     pub fn media_class(&self) -> &'static str {
         match self.kind {
             BusKind::Playback => "Audio/Sink",
@@ -431,9 +441,8 @@ mod tests {
                     id: 1,
                     pos: [0.0, 0.0],
                     kind: NodeKind::Bus(BusSpec {
-                        name: "system-in".into(),
-                        kind: BusKind::Playback,
-                        channels: Channels::Stereo,
+                        description: "Game & music".into(),
+                        ..BusSpec::new("system-in", BusKind::Playback, Channels::Stereo)
                     }),
                 },
                 GraphNode {

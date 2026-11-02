@@ -444,6 +444,15 @@ pub fn revert() -> Result<()> {
         println!("restored autostart {}", dest.display());
     }
     restore_paused()?;
+    // Devices taken over from your PipeWire config: put the config back and restart PipeWire
+    // so it makes them again.
+    let restored = crate::takeover::restore()?;
+    if !restored.is_empty() {
+        for p in &restored {
+            println!("restored {}", p.display());
+        }
+        systemctl(&["restart", "pipewire", "pipewire-pulse", "wireplumber"])?;
+    }
     Ok(())
 }
 

@@ -360,7 +360,7 @@ mod tests {
         GraphNode { id, pos: [0.0, 0.0], kind }
     }
     fn bus(name: &str, kind: BusKind, channels: Channels) -> NodeKind {
-        NodeKind::Bus(BusSpec { name: name.into(), kind, channels })
+        NodeKind::Bus(BusSpec::new(name, kind, channels))
     }
 
     #[test]

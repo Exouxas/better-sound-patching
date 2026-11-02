@@ -20,6 +20,9 @@ pub enum Request {
     Key { key: String },
     /// Signal levels of the processing nodes since the last call, by node name.
     Levels,
+    /// Replace these virtual devices (made elsewhere, e.g. by your PipeWire config, which the
+    /// caller has already moved aside) with our own of the same name.
+    TakeOver { names: Vec<String> },
     /// Stop the daemon. Its links and buses disappear with it.
     Stop { restore_paused: bool },
 }

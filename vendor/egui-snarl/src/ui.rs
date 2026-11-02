@@ -289,6 +289,50 @@ impl NodeLayout {
     }
 }
 
+/// bsp: how close (in screen pixels) the pointer must be to a pin's centre to grab it.
+const PIN_HIT_SCREEN: f32 = 12.0;
+/// bsp: how close (in screen pixels) the pointer must be to a wire to hover it.
+const WIRE_HIT_SCREEN: f32 = 7.0;
+
+/// bsp: where every pin was last frame, so grab areas can be split between close pins.
+#[derive(Clone, Default)]
+struct PinCenters(Vec<Pos2>);
+
+fn pin_centers_id(snarl_id: Id) -> Id {
+    snarl_id.with("bsp-pin-centers")
+}
+
+/// bsp: the area that grabs a pin: up to `PIN_HIT_SCREEN` around its centre on screen
+/// (whatever the zoom), and never smaller than the pin plus a little. Where two pins' areas
+/// would overlap, the border goes halfway between them, so the closer pin is the one grabbed.
+fn pin_hit_rect(ui: &Ui, pin_rect: Rect, snarl_id: Id) -> Rect {
+    let scale = ui
+        .ctx()
+        .layer_transform_to_global(ui.layer_id())
+        .map_or(1.0, |t| t.scaling);
+    let r = (PIN_HIT_SCREEN / scale).max(pin_rect.width().max(pin_rect.height()) * 0.5 + 4.0);
+    let c = pin_rect.center();
+    let (mut half_w, mut half_h) = (r, r);
+    let others: PinCenters = ui
+        .ctx()
+        .data(|d| d.get_temp(pin_centers_id(snarl_id)))
+        .unwrap_or_default();
+    for o in others.0 {
+        let (dx, dy) = ((o.x - c.x).abs(), (o.y - c.y).abs());
+        // Itself (or a pin exactly on top), or far enough away not to overlap.
+        if dx.max(dy) < 0.5 || dx >= 2.0 * r || dy >= 2.0 * r {
+            continue;
+        }
+        // Split along the axis they're further apart on.
+        if dy >= dx {
+            half_h = half_h.min(dy / 2.0);
+        } else {
+            half_w = half_w.min(dx / 2.0);
+        }
+    }
+    Rect::from_center_size(c, vec2(2.0 * half_w, 2.0 * half_h))
+}
+
 /// Controls style of node selection rect.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
@@ -1108,9 +1152,8 @@ where
             drag_released |= response.drag_released;
 
             nodes_bb = nodes_bb.union(response.final_rect);
-            if rect_selection_ended.is_some() {
-                node_rects.push((node_idx, response.final_rect));
-            }
+            // bsp: always kept; wire hovering needs them too.
+            node_rects.push((node_idx, response.final_rect));
         }
     }
 
@@ -1118,22 +1161,28 @@ where
     let mut hovered_wire_disconnect = false;
     let mut wire_shapes = Vec::new();
 
-    // Draw and interact with wires
-    for wire in snarl.wires.iter() {
-        let Some(from_r) = output_info.get(&wire.out_pin) else {
-            continue;
-        };
-        let Some(to_r) = input_info.get(&wire.in_pin) else {
-            continue;
-        };
-
-        if !snarl_state.has_new_wires() && snarl_resp.contains_pointer() && hovered_wire.is_none() {
-            // Try to find hovered wire
-            // If not dragging new wire
-            // And not hovering over item above.
-
-            if let Some(latest_pos) = latest_pos {
-                let wire_hit = hit_wire(
+    // bsp: find the hovered wire first: of all wires near the pointer, the closest one.
+    // Not over a node or right next to one, where the wide tolerance would take clicks meant
+    // for the node; and not while dragging a new wire.
+    let over_node = latest_pos.is_some_and(|p| {
+        let pad = PIN_HIT_SCREEN / to_global.scaling;
+        node_rects.iter().any(|(_, r)| r.expand(pad).contains(p))
+    });
+    if !over_node
+        && !snarl_state.has_new_wires()
+        && snarl_resp.contains_pointer()
+        && let Some(latest_pos) = latest_pos
+    {
+        let max = wire_width.max(WIRE_HIT_SCREEN / to_global.scaling);
+        let mut best: Option<(f32, _)> = None;
+        for wire in snarl.wires.iter() {
+            let (Some(from_r), Some(to_r)) =
+                (output_info.get(&wire.out_pin), input_info.get(&wire.in_pin))
+            else {
+                continue;
+            };
+            let hits = |threshold: f32| {
+                hit_wire(
                     ui.ctx(),
                     WireId::Connected {
                         snarl_id,
@@ -1146,21 +1195,43 @@ where
                     from_r.pos,
                     to_r.pos,
                     latest_pos,
-                    wire_width.max(2.0),
+                    threshold,
                     pick_wire_style(from_r.wire_style, to_r.wire_style),
-                );
-
-                if wire_hit {
-                    hovered_wire = Some(wire);
-
-                    let wire_r =
-                        ui.interact(snarl_resp.rect, ui.make_persistent_id(wire), Sense::click());
-
-                    //Remove hovered wire by second click
-                    hovered_wire_disconnect |= wire_r.clicked_by(PointerButton::Secondary);
+                )
+            };
+            if !hits(max) {
+                continue;
+            }
+            // Narrow down how close it is (hitting is monotonic in the threshold).
+            let (mut lo, mut hi) = (0.0_f32, max);
+            for _ in 0..6 {
+                let mid = (lo + hi) / 2.0;
+                if hits(mid) {
+                    hi = mid;
+                } else {
+                    lo = mid;
                 }
             }
+            if best.is_none_or(|(d, _)| hi < d) {
+                best = Some((hi, wire));
+            }
         }
+        if let Some((_, wire)) = best {
+            hovered_wire = Some(wire);
+            let wire_r = ui.interact(snarl_resp.rect, ui.make_persistent_id(wire), Sense::click());
+            //Remove hovered wire by second click
+            hovered_wire_disconnect |= wire_r.clicked_by(PointerButton::Secondary);
+        }
+    }
+
+    // Draw wires
+    for wire in snarl.wires.iter() {
+        let Some(from_r) = output_info.get(&wire.out_pin) else {
+            continue;
+        };
+        let Some(to_r) = input_info.get(&wire.in_pin) else {
+            continue;
+        };
 
         let color = mix_colors(from_r.wire_color, to_r.wire_color);
 
@@ -1405,6 +1476,17 @@ where
         }
     }
 
+    // bsp: remember where the pins are, for splitting grab areas next frame.
+    let centers = PinCenters(
+        input_info
+            .values()
+            .chain(output_info.values())
+            .map(|p| p.pos)
+            .collect(),
+    );
+    ui.ctx()
+        .data_mut(|d| d.insert_temp(pin_centers_id(snarl_id), centers));
+
     snarl_state.store(snarl, ui.ctx());
 
     snarl_resp
@@ -1491,7 +1573,7 @@ where
             // Interact with pin shape.
             pin_ui.set_clip_rect(snarl_clip_rect);
 
-            let r = pin_ui.interact(pin_rect, pin_ui.next_auto_id(), Sense::click_and_drag());
+            let r = pin_ui.interact(pin_hit_rect(pin_ui, pin_rect, snarl_state.id()), pin_ui.next_auto_id(), Sense::click_and_drag());
 
             pin_ui.skip_ahead_auto_ids(1);
 
@@ -1525,7 +1607,8 @@ where
                 drag_released = true;
             }
 
-            let mut visual_pin_rect = r.rect;
+            // bsp: draw the pin its own size, not the (larger) area that grabs it.
+            let mut visual_pin_rect = pin_rect;
 
             if r.contains_pointer() {
                 if snarl_state.has_new_wires_in() {
@@ -1650,7 +1733,7 @@ where
 
             pin_ui.set_clip_rect(snarl_clip_rect);
 
-            let r = pin_ui.interact(pin_rect, pin_ui.next_auto_id(), Sense::click_and_drag());
+            let r = pin_ui.interact(pin_hit_rect(pin_ui, pin_rect, snarl_state.id()), pin_ui.next_auto_id(), Sense::click_and_drag());
 
             pin_ui.skip_ahead_auto_ids(1);
 
@@ -1685,7 +1768,8 @@ where
                 drag_released = true;
             }
 
-            let mut visual_pin_rect = r.rect;
+            // bsp: draw the pin its own size, not the (larger) area that grabs it.
+            let mut visual_pin_rect = pin_rect;
 
             if r.contains_pointer() {
                 if snarl_state.has_new_wires_out() {

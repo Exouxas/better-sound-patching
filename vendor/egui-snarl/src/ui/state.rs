@@ -328,6 +328,11 @@ impl SnarlState {
         }
     }
 
+    /// bsp: the widget id.
+    pub const fn id(&self) -> Id {
+        self.id
+    }
+
     pub const fn to_global(&self) -> TSTransform {
         self.to_global
     }

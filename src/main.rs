@@ -8,6 +8,7 @@ mod live;
 mod model;
 mod planner;
 mod session;
+mod takeover;
 
 use anyhow::{Result, bail};
 use clap::{Parser, Subcommand};

@@ -12,6 +12,7 @@ use crate::ipc::{self, Request, Response, Status};
 use crate::live::Live;
 use crate::model::{self, BusKind, Graph, NodeKind, Selections};
 use crate::planner;
+use crate::takeover;
 use crate::session::{self, KNOWN_CONFLICTS, PausedApp};
 use anyhow::{Result, anyhow};
 use egui::{Color32, RichText};
@@ -59,6 +60,8 @@ enum Dialog {
     Trial { pause: Vec<(&'static str, bool)> },
     Approve { disable: Vec<(&'static str, bool)> },
     Revert,
+    /// Devices made by your PipeWire config, and where each comes from.
+    TakeOver { items: Vec<(String, String, takeover::Origin)> },
 }
 
 struct App {
@@ -266,6 +269,17 @@ impl App {
                 self.snarl = graph::to_snarl(&g);
                 // Compare against the normalized form (node ids are renumbered on load).
                 self.saved = graph::from_snarl(&self.snarl);
+                // Labels on virtual devices used to live in labels.toml; they're the device's
+                // name now. Carry them over (shows as an unsaved change until you Save).
+                let ids: Vec<_> = self.snarl.node_ids().map(|(id, _)| id).collect();
+                for id in ids {
+                    if let NodeKind::Bus(b) = &mut self.snarl[id]
+                        && b.description.is_empty()
+                        && let Some(l) = self.labels.get(&b.name).filter(|l| !l.is_empty())
+                    {
+                        b.description = l.clone();
+                    }
+                }
             }
             Err(e) => self.notify(format!("{e:#}"), true),
         }
@@ -307,6 +321,22 @@ impl App {
                 _ => {}
             }
         }
+    }
+
+    /// Virtual devices in the saved graph that exist but weren't made by the daemon:
+    /// (node name, name to show).
+    fn foreign_buses(&self, s: &Status) -> Vec<(String, String)> {
+        let live = self.live.lock().unwrap();
+        self.saved
+            .nodes
+            .iter()
+            .filter_map(|n| match &n.kind {
+                NodeKind::Bus(b) if live.node_by_name(&b.name).is_some() && !s.buses_owned.contains(&b.name) => {
+                    Some((b.name.clone(), b.display().to_owned()))
+                }
+                _ => None,
+            })
+            .collect()
     }
 
     fn current(&self) -> Graph {
@@ -384,7 +414,22 @@ impl App {
         if !daemon_running {
             return;
         }
-        let current = self.current();
+        let mut current = self.current();
+        // Renaming a device means making it again (a short gap), so names change on Save, not
+        // with every key typed: preview with the saved names.
+        for n in &mut current.nodes {
+            if let NodeKind::Bus(b) = &mut n.kind {
+                b.description = self
+                    .saved
+                    .nodes
+                    .iter()
+                    .find_map(|s| match &s.kind {
+                        NodeKind::Bus(sb) if sb.name == b.name => Some(sb.description.clone()),
+                        _ => None,
+                    })
+                    .unwrap_or_default();
+            }
+        }
         let last = self.preview_sent.as_ref().unwrap_or(&self.saved);
         if current == *last {
             return;
@@ -461,6 +506,19 @@ impl App {
                     if ui.add_enabled(!busy, egui::Button::new("Revert to old setup…")).clicked() {
                         self.dialog = Some(Dialog::Revert);
                     }
+                    let foreign = self.foreign_buses(s);
+                    if !foreign.is_empty() {
+                        let text = RichText::new(format!("Take over {} device{}…", foreign.len(), if foreign.len() == 1 { "" } else { "s" }))
+                            .color(Color32::from_rgb(230, 170, 60));
+                        let hover = "These virtual devices are made by your PipeWire config, so they can't be renamed here. \
+                                     Take them over to have this program make them instead.";
+                        if ui.add_enabled(!busy, egui::Button::new(text)).on_hover_text(hover).clicked() {
+                            let names: Vec<String> = foreign.iter().map(|f| f.0.clone()).collect();
+                            let origins = takeover::find(&names);
+                            let items = foreign.into_iter().map(|(n, d)| { let o = origins[&n].clone(); (n, d, o) }).collect();
+                            self.dialog = Some(Dialog::TakeOver { items });
+                        }
+                    }
                 }
                 (Some(s), false) => {
                     ui.label(RichText::new("⚠ Trial running — not permanent").color(Color32::from_rgb(230, 170, 60)));
@@ -533,7 +591,7 @@ impl App {
                 && let Some(ln) = live.node_by_name(&b.name)
             {
                 let icon = if b.kind == BusKind::Playback { "🔊" } else { "🎤" };
-                strips.push((ln.id, graph::display_name(&self.labels, &b.name, &b.name), icon));
+                strips.push((ln.id, b.display().to_owned(), icon));
             }
         }
         let mut devices: Vec<(u32, String, &'static str)> = live
@@ -650,9 +708,79 @@ impl App {
                         }
                     });
                 }
+                Dialog::TakeOver { items } => {
+                    ui.heading("Take over these devices?");
+                    ui.label(
+                        "Your PipeWire config makes these virtual devices. Taking them over moves that config into \
+                         this program's backup folder, and the daemon makes the devices itself, with the same \
+                         internal names, so programs keep finding them. After that, their labels are the names \
+                         programs and sound settings show.",
+                    );
+                    ui.add_space(6.0);
+                    let mut files: Vec<std::path::PathBuf> = vec![];
+                    let mut names: Vec<String> = vec![];
+                    for (name, display, origin) in items.iter() {
+                        let home = dirs::home_dir().unwrap_or_default();
+                        let short = |p: &std::path::Path| match p.strip_prefix(&home) {
+                            Ok(r) => format!("~/{}", r.display()),
+                            Err(_) => p.display().to_string(),
+                        };
+                        ui.label(RichText::new(display).strong());
+                        match origin {
+                            takeover::Origin::File { path, also } => {
+                                ui.label(RichText::new(format!("from {}", short(path))).small());
+                                if !also.is_empty() {
+                                    ui.label(
+                                        RichText::new(format!("That file also makes {}, which will be gone too.", also.join(", ")))
+                                            .small()
+                                            .color(Color32::from_rgb(230, 170, 60)),
+                                    );
+                                }
+                                if !files.contains(path) {
+                                    files.push(path.clone());
+                                }
+                                names.push(name.clone());
+                            }
+                            takeover::Origin::Fixed(path) => {
+                                ui.label(RichText::new(format!("from {}, which this program won't change; skipped", short(path))).small().weak());
+                            }
+                            takeover::Origin::Unknown => {
+                                ui.label(RichText::new("not from a PipeWire config file (some program makes it); skipped").small().weak());
+                            }
+                        }
+                    }
+                    ui.add_space(6.0);
+                    ui.label(
+                        RichText::new(
+                            "Programs using these devices lose sound for a moment while they're replaced. \
+                             From then on the devices exist only while this program runs (it starts at login). \
+                             \"Revert to old setup\" puts the config back.",
+                        )
+                        .small(),
+                    );
+                    ui.horizontal(|ui| {
+                        if ui.add_enabled(!names.is_empty(), egui::Button::new("Take over")).clicked() {
+                            self.background(move || {
+                                takeover::move_aside(&files)?;
+                                match ipc::request(&Request::TakeOver { names: names.clone() })? {
+                                    Response::Error(e) => anyhow::bail!(e),
+                                    _ => Ok(format!("Took over {}", names.join(", "))),
+                                }
+                            });
+                            keep = false;
+                        }
+                        if ui.button("Cancel").clicked() {
+                            keep = false;
+                        }
+                    });
+                }
                 Dialog::Revert => {
                     ui.heading("Revert to your old setup?");
-                    ui.label("Stops and removes the service and restores the autostart entries it moved aside.");
+                    ui.label(
+                        "Stops and removes the service and restores the autostart entries it moved aside. \
+                         PipeWire config this program took over is put back, and PipeWire restarts so it makes \
+                         those devices again.",
+                    );
                     ui.horizontal(|ui| {
                         if ui.button("Revert").clicked() {
                             self.background(|| {
@@ -680,7 +808,7 @@ fn starter_graph() -> Graph {
     let bus = |id, x, y, name: &str, kind, channels| GraphNode {
         id,
         pos: [x, y],
-        kind: NodeKind::Bus(BusSpec { name: name.into(), kind, channels }),
+        kind: NodeKind::Bus(BusSpec::new(name, kind, channels)),
     };
     Graph {
         nodes: vec![
@@ -746,6 +874,7 @@ impl eframe::App for App {
                 active_slots: &plan.active_slots,
                 readings: &readings,
                 running: info.status.is_some(),
+                owned_buses: info.status.as_ref().map_or(&[], |s| s.buses_owned.as_slice()),
                 select: None,
                 fit_to: std::mem::take(&mut self.fit_pending).then(|| ui.max_rect()),
                 transform: None,

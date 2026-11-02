@@ -63,6 +63,8 @@ pub struct Viewer<'a> {
     pub readings: &'a BTreeMap<String, Reading>,
     /// Whether the new system is running (processing nodes only exist then).
     pub running: bool,
+    /// Virtual devices the daemon made (and so can rename); others come from elsewhere.
+    pub owned_buses: &'a [String],
     /// A switch pin the user clicked this frame: (switch name, pin).
     pub select: Option<(String, u32)>,
     /// Set to the graph area to zoom and pan so every node fits in it (once).
@@ -190,11 +192,7 @@ impl Viewer<'_> {
     }
 
     /// A switch: pick which pin is live, name the pins, and give them keyboard shortcuts.
-    fn switch_editor(&mut self, ui: &mut Ui, node: NodeId, name: &mut String, pins: &mut Vec<SwitchPin>, outputs: bool, dropped: &mut Vec<(bool, usize)>) {
-        ui.horizontal(|ui| {
-            ui.label("Name");
-            self.changed |= ui.add(egui::TextEdit::singleline(name).desired_width(140.0)).changed();
-        });
+    fn switch_editor(&mut self, ui: &mut Ui, node: NodeId, name: &str, pins: &mut Vec<SwitchPin>, outputs: bool, dropped: &mut Vec<(bool, usize)>) {
         let active = self.active_slots.get(&(node.0 as u32)).copied().flatten();
         ui.label(RichText::new(if outputs { "Click a number to send audio there." } else { "Click a number to use that input." }).small().weak());
         for (k, pin) in pins.iter_mut().enumerate() {
@@ -203,7 +201,7 @@ impl Viewer<'_> {
                 let text = RichText::new(format!(" {} ", k + 1)).strong().color(if on { Color32::BLACK } else { GREY });
                 let b = egui::Button::new(text).fill(if on { GREEN } else { Color32::from_gray(40) });
                 if ui.add(b).on_hover_text("Use this pin").clicked() && !on {
-                    self.select = Some((name.clone(), k as u32));
+                    self.select = Some((name.to_owned(), k as u32));
                 }
                 self.changed |= ui.add(egui::TextEdit::singleline(&mut pin.label).hint_text("label").desired_width(90.0)).changed();
                 self.changed |= key_field(ui, (node, k), &mut pin.key);
@@ -321,20 +319,17 @@ impl SnarlViewer<NodeKind> for Viewer<'_> {
                     BusKind::Playback => "Virtual output",
                     BusKind::Microphone => "Virtual mic",
                 };
-                match self.labels.get(&b.name).filter(|l| !l.is_empty()) {
-                    Some(l) => format!("{kind} · {l}"),
-                    None => kind.into(),
-                }
+                format!("{kind} · {}", b.display())
             }
-            NodeKind::Eq(e) => format!("EQ · {}", display_name(self.labels, &e.name, &e.name)),
+            NodeKind::Eq(_) => "EQ".into(),
             NodeKind::App { app: Some(a) } => format!("App · {}", self.app_name(&a.binary)),
             NodeKind::App { app: None } => "App".into(),
             NodeKind::OtherAppsPlayback => "Other apps · playback".into(),
             NodeKind::OtherAppsRecording => "Other apps · recording".into(),
-            NodeKind::SwitchOutput { name, .. } => format!("Output switch · {name}"),
-            NodeKind::SwitchInput { name, .. } => format!("Input switch · {name}"),
-            NodeKind::Levels(l) => format!("Levels · {}", l.name),
-            NodeKind::Volume(v) => format!("Volume · {}", v.name),
+            NodeKind::SwitchOutput { .. } => "Output switch".into(),
+            NodeKind::SwitchInput { .. } => "Input switch".into(),
+            NodeKind::Levels(_) => "Levels".into(),
+            NodeKind::Volume(_) => "Volume".into(),
         }
     }
 
@@ -415,13 +410,17 @@ impl SnarlViewer<NodeKind> for Viewer<'_> {
                 NodeKind::Input { device } => self.device_picker(ui, node, device, true),
                 NodeKind::Output { device } => self.device_picker(ui, node, device, false),
                 NodeKind::Bus(b) => {
+                    // The label is the name programs and sound settings show.
                     ui.horizontal(|ui| {
-                        ui.label("Name");
-                        let r = ui.add(egui::TextEdit::singleline(&mut b.name).desired_width(150.0));
+                        ui.label("Label");
+                        let r = ui.add(egui::TextEdit::singleline(&mut b.description).hint_text(b.name.as_str()).desired_width(170.0));
                         self.changed |= r.changed();
                     });
-                    let bus_name = b.name.clone();
-                    self.label_editor(ui, &bus_name, "optional");
+                    let present = self.present(node);
+                    if present && self.running && !self.owned_buses.contains(&b.name) {
+                        ui.label(RichText::new("Made outside this program, so its name there can't change yet. \
+                            Approve, then use \"Take over\" in the bottom bar.").small().color(AMBER));
+                    }
                     ui.horizontal(|ui| {
                         for (c, label) in [(Channels::Mono, "Mono"), (Channels::Stereo, "Stereo")] {
                             if ui.selectable_label(b.channels == c, label).clicked() && b.channels != c {
@@ -435,7 +434,7 @@ impl SnarlViewer<NodeKind> for Viewer<'_> {
                         BusKind::Microphone => "Feed its in; apps can record from it.",
                     };
                     ui.label(RichText::new(hint).small().weak());
-                    if self.present(node) {
+                    if present {
                         ui.label(RichText::new("✔ exists").color(GREEN).small());
                     } else {
                         ui.label(RichText::new("created when the new system is active").color(GREY).small());
@@ -501,10 +500,10 @@ impl SnarlViewer<NodeKind> for Viewer<'_> {
             add = Some(NodeKind::Output { device: None });
         }
         if ui.button("Virtual output (apps play into it)").clicked() {
-            add = Some(NodeKind::Bus(BusSpec { name: "new-output".into(), kind: BusKind::Playback, channels: Channels::Stereo }));
+            add = Some(NodeKind::Bus(BusSpec::new(&unique_name(snarl, "output"), BusKind::Playback, Channels::Stereo)));
         }
         if ui.button("Virtual mic (apps record from it)").clicked() {
-            add = Some(NodeKind::Bus(BusSpec { name: "new-mic".into(), kind: BusKind::Microphone, channels: Channels::Mono }));
+            add = Some(NodeKind::Bus(BusSpec::new(&unique_name(snarl, "mic"), BusKind::Microphone, Channels::Mono)));
         }
         if ui.button("Equalizer").clicked() {
             let mut eq = EqSpec::new(&unique_name(snarl, "eq"), Channels::Stereo);
@@ -653,8 +652,6 @@ fn meter_bar(painter: &egui::Painter, rect: Rect, peak: Option<f32>) {
 /// handles you drag along the scale.
 fn levels_editor(ui: &mut Ui, node: NodeId, l: &mut LevelsSpec, reading: Option<Reading>) {
     ui.horizontal(|ui| {
-        ui.label("Name");
-        ui.add(egui::TextEdit::singleline(&mut l.name).desired_width(110.0));
         for (c, label) in [(Channels::Mono, "Mono"), (Channels::Stereo, "Stereo")] {
             if ui.selectable_label(l.channels == c, label).clicked() {
                 l.channels = c;
@@ -729,8 +726,6 @@ fn levels_editor(ui: &mut Ui, node: NodeId, l: &mut LevelsSpec, reading: Option<
 /// Volume: a linear 0–200% slider (type a number for anything beyond), with a level meter.
 fn volume_editor(ui: &mut Ui, v: &mut VolumeSpec, reading: Option<Reading>) {
     ui.horizontal(|ui| {
-        ui.label("Name");
-        ui.add(egui::TextEdit::singleline(&mut v.name).desired_width(110.0));
         for (c, label) in [(Channels::Mono, "Mono"), (Channels::Stereo, "Stereo")] {
             if ui.selectable_label(v.channels == c, label).clicked() {
                 v.channels = c;
@@ -833,8 +828,6 @@ fn eq_editor(ui: &mut Ui, node: NodeId, eq: &mut EqSpec) {
     let mut selected: usize = ui.data(|d| d.get_temp(sel_id)).unwrap_or(0);
 
     ui.horizontal(|ui| {
-        ui.label("Name");
-        ui.add(egui::TextEdit::singleline(&mut eq.name).desired_width(110.0));
         for (c, label) in [(Channels::Mono, "Mono"), (Channels::Stereo, "Stereo")] {
             if ui.selectable_label(eq.channels == c, label).clicked() {
                 eq.channels = c;

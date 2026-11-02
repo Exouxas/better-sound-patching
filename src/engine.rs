@@ -13,7 +13,7 @@ use anyhow::{Result, anyhow};
 use pipewire as pw;
 use pw::types::ObjectType;
 use std::cell::RefCell;
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::rc::Rc;
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
@@ -64,6 +64,21 @@ struct OwnedBus {
     spec: BusSpec,
 }
 
+/// While the default output is being replaced (renamed, or its channels changed), a silent
+/// stand-in is the default, so programs never fall back to a real device for a moment —
+/// unprocessed and possibly far louder than the graph would make them.
+struct Hold {
+    _proxy: pw::node::Node,
+    /// The live node being replaced; the default stays off it until a new one exists.
+    replaced: u32,
+    /// When the stand-in was made the default.
+    default_at: Option<Instant>,
+    /// When the default went to the new device; the stand-in goes a little after.
+    done_at: Option<Instant>,
+}
+
+const HOLD_NAME: &str = "bsp-switching";
+
 #[derive(Default)]
 struct State {
     live: Live,
@@ -72,6 +87,10 @@ struct State {
     selected: Selections,
     links: HashMap<PortPair, OwnedLink>,
     buses: HashMap<String, OwnedBus>,
+    hold: Option<Hold>,
+    /// Devices made elsewhere that we're replacing with our own (see `Request::TakeOver`),
+    /// and when we asked PipeWire to remove the old one.
+    take_over: BTreeMap<String, Option<Instant>>,
     filters: HashMap<String, FilterNode>,
     /// App streams we route ourselves. When we let go, they get linked back to the default.
     taken: BTreeSet<u32>,
@@ -215,10 +234,11 @@ fn create_bus(core: &pw::core::CoreRc, spec: &BusSpec) -> Result<pw::node::Node>
     let mut props = pw::properties::properties! {
         "factory.name" => "support.null-audio-sink",
         "node.name" => spec.name.as_str(),
-        "node.description" => spec.name.as_str(),
+        "node.description" => spec.display(),
         "media.class" => spec.media_class(),
         "audio.position" => position,
-        "node.virtual" => "true",
+        // Not `node.virtual`: that makes PipeWire report it as a non-hardware device, and
+        // desktop sound settings (KDE's included) hide those unless asked to show virtual ones.
         "object.linger" => "false",
     };
     if spec.kind == BusKind::Playback {
@@ -291,7 +311,7 @@ fn set_default(live: &Live, last: &mut Option<String>, original: &mut Option<u32
     if last.as_deref() == Some(node.name.as_str()) {
         return;
     }
-    if last.is_none() {
+    if last.is_none() && original.is_none() {
         *original = current_default(sink);
     }
     log::info!("default {} -> {}", if sink { "output" } else { "input" }, node.name);
@@ -302,11 +322,67 @@ fn set_default(live: &Live, last: &mut Option<String>, original: &mut Option<u32
     });
 }
 
+/// A device we own that is the default output is about to be replaced (its settings changed).
+/// First make a silent stand-in the default and give WirePlumber a moment to move programs
+/// onto it. Returns true while the old device must be kept a little longer.
+fn replace_default_safely(st: &mut State, core: &pw::core::CoreRc, wanted: &[BusSpec]) -> bool {
+    if test_mode() || st.hold.is_some_and_ready() {
+        return false;
+    }
+    let Some(hold) = &mut st.hold else {
+        let is_default = |name: &str| st.default_sink.as_deref() == Some(name);
+        let changed = st
+            .buses
+            .iter()
+            .find(|(name, owned)| {
+                owned.spec.kind == BusKind::Playback && is_default(name) && wanted.iter().any(|b| &b.name == *name && *b != owned.spec)
+            })
+            .map(|(name, _)| name)
+            .or_else(|| st.take_over.keys().find(|name| is_default(name)));
+        let Some(name) = changed else { return false };
+        let Some(old) = st.live.node_by_name(name).map(|n| n.id) else { return false };
+        let spec = BusSpec { description: "Switching…".into(), ..BusSpec::new(HOLD_NAME, BusKind::Playback, model::Channels::Stereo) };
+        return match create_bus(core, &spec) {
+            Ok(proxy) => {
+                log::info!("replacing default output {name}: holding programs on a silent stand-in");
+                st.hold = Some(Hold { _proxy: proxy, replaced: old, default_at: None, done_at: None });
+                st.dirty = true;
+                true
+            }
+            Err(e) => {
+                log::warn!("no stand-in for replacing {name}: {e}");
+                false
+            }
+        };
+    };
+    if hold.default_at.is_none() {
+        let Some(id) = st.live.node_by_name(HOLD_NAME).map(|n| n.id) else { return true };
+        // Wait for this to take effect before the old device goes.
+        let _ = std::process::Command::new("wpctl").args(["set-default", &id.to_string()]).status();
+        hold.default_at = Some(Instant::now());
+        st.default_sink = Some(HOLD_NAME.into());
+        return true;
+    }
+    hold.default_at.is_some_and(|t| t.elapsed() < Duration::from_millis(300))
+}
+
+trait HoldReady {
+    fn is_some_and_ready(&self) -> bool;
+}
+impl HoldReady for Option<Hold> {
+    /// The stand-in already took over and the old device was let go.
+    fn is_some_and_ready(&self) -> bool {
+        self.as_ref().is_some_and(|h| h.default_at.is_some_and(|t| t.elapsed() >= Duration::from_millis(300)))
+    }
+}
+
 /// Bring PipeWire in line with the routing graph.
 fn reconcile(st: &mut State, core: &pw::core::CoreRc, registry: &pw::registry::RegistryRc) {
     let Some(profile) = st.profile.clone() else {
         st.links.clear();
         st.buses.clear();
+        st.hold = None;
+        st.take_over.clear();
         st.filters.clear();
         let taken: Vec<u32> = std::mem::take(&mut st.taken).into_iter().collect();
         hand_back(st, core, &taken);
@@ -345,7 +421,38 @@ fn reconcile(st: &mut State, core: &pw::core::CoreRc, registry: &pw::registry::R
 
     // Virtual devices: keep ours, adopt same-named ones that already exist (e.g. from your
     // existing pipewire.conf.d), create the rest, and drop ours that the profile no longer uses.
-    st.buses.retain(|name, owned| plan.buses.iter().any(|b| &b.name == name && *b == owned.spec));
+    let wait = replace_default_safely(st, core, &plan.buses);
+    st.buses.retain(|name, owned| match plan.buses.iter().find(|b| &b.name == name) {
+        None => false,
+        Some(b) => *b == owned.spec || wait,
+    });
+    // Devices we're taking over: remove the old one, then (below) make ours once it's gone.
+    if !wait {
+        let names: Vec<String> = st.take_over.keys().cloned().collect();
+        for name in names {
+            let old = st.live.node_by_name(&name).map(|n| n.id);
+            let asked = st.take_over[&name];
+            match (old, asked) {
+                _ if st.buses.contains_key(&name) || !plan.buses.iter().any(|b| b.name == name) => {
+                    st.take_over.remove(&name);
+                }
+                (None, _) => {
+                    log::info!("took over {name}");
+                    st.take_over.remove(&name);
+                }
+                (Some(id), None) => {
+                    log::info!("taking over {name}: removing the one made elsewhere");
+                    registry.destroy_global(id);
+                    st.take_over.insert(name, Some(Instant::now()));
+                }
+                (Some(_), Some(t)) if t.elapsed() > Duration::from_secs(3) => {
+                    st.last_error = Some(format!("couldn't remove the old {name}; restart PipeWire to finish taking it over"));
+                    st.take_over.remove(&name);
+                }
+                _ => {}
+            }
+        }
+    }
     for spec in &plan.buses {
         if st.buses.contains_key(&spec.name) || st.live.node_by_name(&spec.name).is_some() {
             continue;
@@ -403,7 +510,20 @@ fn reconcile(st: &mut State, core: &pw::core::CoreRc, registry: &pw::registry::R
     let released: Vec<u32> = st.taken.difference(&plan.app_streams).copied().collect();
     st.taken = plan.app_streams.clone();
     hand_back(st, core, &released);
-    set_default(&st.live, &mut st.default_sink, &mut st.original_sink, plan.default_sink, true);
+    // While the stand-in holds the default, only move the default to the replacement device.
+    let hold_blocks = st.hold.as_ref().is_some_and(|h| h.done_at.is_none() && plan.default_sink.is_none_or(|id| id == h.replaced));
+    if !hold_blocks {
+        set_default(&st.live, &mut st.default_sink, &mut st.original_sink, plan.default_sink, true);
+        if let Some(h) = &mut st.hold {
+            h.done_at.get_or_insert_with(Instant::now);
+        }
+    }
+    if st.hold.as_ref().is_some_and(|h| h.done_at.is_some_and(|t| t.elapsed() > Duration::from_millis(1500))) {
+        log::info!("default output replaced; removing the stand-in");
+        st.hold = None;
+    }
+    // Keep ticking until the replacement is done.
+    st.dirty |= st.hold.is_some() || !st.take_over.is_empty();
     set_default(&st.live, &mut st.default_source, &mut st.original_source, plan.default_source, false);
 
     // Conflicting links made by others (qpwgraph, old sessions, ...).
@@ -582,6 +702,14 @@ pub fn run(cfg: EngineConfig, cmd_rx: pw::channel::Receiver<Cmd>) -> Result<Exit
                             Response::Ok
                         }
                         Request::Preview { .. } => Response::Error("not enforcing".into()),
+                        Request::TakeOver { names } if enforce => {
+                            for n in names {
+                                st.take_over.insert(n, None);
+                            }
+                            reconcile(&mut st, &core_for_cmd, &registry_for_cmd);
+                            Response::Ok
+                        }
+                        Request::TakeOver { .. } => Response::Error("not enforcing".into()),
                         Request::Stop { restore_paused } => {
                             st.restore_paused = restore_paused;
                             if let Some(ml) = ml.upgrade() {
