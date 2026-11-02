@@ -212,6 +212,8 @@ fn wpctl(args: Vec<String>) {
 impl App {
     fn new(cc: &eframe::CreationContext) -> Self {
         cc.egui_ctx.set_theme(egui::Theme::Dark);
+        // Only text fields are selectable; titles, pin names and other labels are not.
+        cc.egui_ctx.all_styles_mut(|s| s.interaction.selectable_labels = false);
         let live = Arc::new(Mutex::new(Live::default()));
         let daemon = Arc::new(Mutex::new(DaemonInfo::default()));
         let volumes = Arc::new(Mutex::new(HashMap::new()));
