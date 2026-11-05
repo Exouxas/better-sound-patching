@@ -1,0 +1,11 @@
+post_install() {
+  echo 'Open "Better Sound Patching" from your app menu to build a routing graph,'
+  echo 'then press Approve in it to start it at login.'
+  echo 'If you approved a self-built copy before, run once:  better-sound-patching approve'
+  echo 'It switches to the packaged files and removes the copy in ~/.local.'
+}
+
+post_upgrade() {
+  echo 'The routing daemon keeps running the old version until it restarts:'
+  echo 'log out and in, or run  systemctl --user restart better-sound-patching'
+}

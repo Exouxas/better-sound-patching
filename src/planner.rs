@@ -261,8 +261,8 @@ pub fn plan(profile: &Graph, live: &Live, selected: &Selections) -> Plan {
         }
     }
 
-    // Everything the profile mentions, all hardware (unused hardware gets nothing, like in
-    // Voicemeeter) and the app streams we took over are ours to control.
+    // Everything the profile mentions, all hardware (unused hardware gets
+    // nothing) and the app streams we took over are ours to control.
     let mut managed: BTreeSet<u32> = profile
         .nodes
         .iter()

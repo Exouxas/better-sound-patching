@@ -9,7 +9,7 @@
   <img alt="GUI" src="https://img.shields.io/badge/GUI-native%20egui-8b949e">
 </p>
 
-**Better Sound Patching** (`bsp`) is a Voicemeeter-style patchbay for Linux. You draw how audio should
+**Better Sound Patching** is an audio patchbay and mixer for Linux. You draw how audio should
 flow (programs, virtual devices, equalizers, level controls, and your real hardware) as a node graph,
 and a small daemon keeps PipeWire wired exactly that way. Plug a device in, restart a program, or
 switch from headset to speakers with one key: the routing stays what you drew.
@@ -37,7 +37,7 @@ It is written entirely in Rust with a native GUI. There is no Electron, no web v
   settings show, so `system-in` can be "Game & music".
 - **Per-program routing.** Give Discord (or anything else) its own node; every other program follows the
   "Other apps" nodes, which set the system default devices.
-- **Unused hardware stays silent**, like Voicemeeter: nothing reaches a device unless the graph says so.
+- **Unused hardware stays silent**: nothing reaches a device unless the graph says so.
 - **Takes over your old setup.** Virtual devices your PipeWire config already makes are adopted as they
   are; one button moves that config aside so this program makes them instead.
 - **Safe to try.** A trial changes nothing permanent. Stop it, or reboot, and your old setup is back.
@@ -74,7 +74,7 @@ and possibly far louder than your graph would make them.
 | **Equalizer** | Up to 32 bands (bell, shelves, low and high pass, notch) with a live response curve. |
 | **Levels** | Input and output meters, a noise gate (bottom limit) and a limiter (top limit). |
 | **Volume** | A 0–200% slider, or type any value up to 1000%. |
-| **Output switch / Input switch** | Numbered pins; exactly one is live. Click it, run `bsp select`, or press its key. |
+| **Output switch / Input switch** | Numbered pins; exactly one is live. Click it, press its key, or run `better-sound-patching select`. |
 
 ### Editing
 
@@ -93,20 +93,55 @@ favourite EQ in a text file.
 
 ## Getting started
 
+### Install
+
+On Arch Linux and derivatives (CachyOS, EndeavourOS, Manjaro…), the package recipe lives in this
+repository under `packaging/aur/`. It isn't on the AUR yet, but [paru](https://github.com/Morganamilo/paru)
+can use this repository the same way. Add these lines to the end of your paru config
+(`~/.config/paru/paru.conf` if you have one, otherwise `/etc/paru.conf`):
+
+```ini
+[better-sound-patching]
+Url = https://github.com/Exouxas/better-sound-patching
+Path = packaging/aur
+```
+
+Then install it:
+
+```sh
+paru -Sy --pkgbuilds                       # fetch the recipe
+paru -S better-sound-patching-git
+```
+
+It builds the latest commit, and paru updates it with the rest of the system whenever there is a new
+commit (`paru -Syu --devel`, or just `paru` if `Devel` is on in your config). Then open **Better Sound
+Patching** from your app menu.
+
+Without paru, build the package once by hand. It won't update by itself:
+
+```sh
+git clone https://github.com/Exouxas/better-sound-patching.git
+cd better-sound-patching/packaging/aur/better-sound-patching-git
+makepkg -si
+```
+
+After an update the running daemon keeps the old version until it restarts: log out and in, or run
+`systemctl --user restart better-sound-patching`.
+
 ### Requirements
 
 - Linux with **PipeWire** 1.x and **WirePlumber** 0.5
-- **Rust** 1.95 or newer and **clang**, which the PipeWire bindings need to build
+- To build it yourself: **Rust** 1.95 or newer and **clang**, which the PipeWire bindings need
 - Optional: a desktop with the XDG GlobalShortcuts portal for global keys, and a system tray
   (StatusNotifierItem) for the tray icon. KDE Plasma 6 has both.
 
-### Build
+### Build it yourself
 
 ```sh
 git clone https://github.com/Exouxas/better-sound-patching.git
 cd better-sound-patching
 cargo build --release
-./target/release/bsp            # opens the editor
+./target/release/better-sound-patching      # opens the editor
 ```
 
 ### Adopt it safely
@@ -115,23 +150,28 @@ Nothing changes until you ask, and every step can be undone:
 
 | Step | What changes | How to undo |
 |---|---|---|
-| `bsp` / `bsp plan` | Nothing. The editor and the dry run only read. | — |
-| `bsp trial` (or **Try the new system…**) | Routing follows your graph; qpwgraph and EasyEffects are paused for this session. | `bsp stop`, or reboot |
-| `bsp approve` | Installs `~/.local/bin/bsp`, a systemd user service (with the tray icon) and a menu entry; moves conflicting autostart entries aside. | `bsp revert` |
-| **Take over…** (after approving) | Moves the PipeWire config that makes your virtual devices into a backup folder; the daemon makes them instead, so their labels become their names. | `bsp revert` puts it back and restarts PipeWire |
+| Open the editor, or `better-sound-patching plan` | Nothing. The editor and the dry run only read. | — |
+| **Try the new system…** (or `better-sound-patching trial`) | Routing follows your graph; qpwgraph and EasyEffects are paused for this session. | **Stop**, `better-sound-patching stop`, or reboot |
+| **Approve** (or `better-sound-patching approve`) | Starts the daemon (with the tray icon) at login as a systemd user service; moves conflicting autostart entries aside. A self-built copy also installs itself to `~/.local/bin` with a menu entry. | **Revert** / `better-sound-patching revert` |
+| **Take over…** (after approving) | Moves the PipeWire config that makes your virtual devices into a backup folder; the daemon makes them instead, so their labels become their names. | Revert puts it back and restarts PipeWire |
+
+If you approved a self-built copy and then install the package, run `better-sound-patching approve`
+once: it switches to the packaged files and removes the copy in `~/.local`.
 
 ## Command line
 
+You rarely need it (the tray icon and the editor cover everything), but every action has a command:
+
 ```text
-bsp                         Open the editor and mixer
-bsp plan                    Dry run: what the graph would change right now
-bsp trial                   Start a trial (nothing permanent)
-bsp stop                    Stop and give control back to your old setup
-bsp select Output 2         Make a switch use pin 2
-bsp key Ctrl+Alt+3          Act as if that shortcut was pressed
-bsp status                  Show what the daemon is doing
-bsp approve | revert        Start at login / undo that
-bsp restore                 Relaunch programs a trial paused (after a crash)
+better-sound-patching                     Open the editor and mixer
+better-sound-patching plan                Dry run: what the graph would change right now
+better-sound-patching trial               Start a trial (nothing permanent)
+better-sound-patching stop                Stop and give control back to your old setup
+better-sound-patching select Output 2     Make a switch use pin 2
+better-sound-patching key Ctrl+Alt+3      Act as if that shortcut was pressed
+better-sound-patching status              Show what the daemon is doing
+better-sound-patching approve | revert    Start at login / undo that
+better-sound-patching restore             Relaunch programs a trial paused (after a crash)
 ```
 
 ## Configuration

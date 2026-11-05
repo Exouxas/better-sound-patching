@@ -855,9 +855,15 @@ impl App {
                 Dialog::Approve { disable } => {
                     ui.heading("Make it permanent");
                     ui.label(
-                        "Installs the daemon to ~/.local/bin and starts it at login as a systemd user service. \
-                         The programs ticked below won't autostart anymore; their autostart files are moved aside, \
-                         not deleted. \"Revert\" undoes all of this.",
+                        if session::is_packaged() {
+                            "Starts the daemon at login (the systemd user service your package installed). \
+                             The programs ticked below won't autostart anymore; their autostart files are moved aside, \
+                             not deleted. \"Revert\" undoes all of this."
+                        } else {
+                            "Installs the daemon to ~/.local/bin and starts it at login as a systemd user service. \
+                             The programs ticked below won't autostart anymore; their autostart files are moved aside, \
+                             not deleted. \"Revert\" undoes all of this."
+                        },
                     );
                     for (name, on) in disable.iter_mut() {
                         ui.checkbox(on, format!("Stop autostarting {name}"));

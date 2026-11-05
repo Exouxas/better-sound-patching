@@ -1,0 +1,7 @@
+[Desktop Entry]
+Type=Application
+Name=Better Sound Patching
+Comment=Audio routing and mixer
+Exec=/usr/bin/better-sound-patching gui
+Icon=better-sound-patching
+Categories=AudioVideo;Audio;Mixer;

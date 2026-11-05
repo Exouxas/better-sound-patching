@@ -1,7 +1,10 @@
 [package]
-name = "bsp"
+name = "better-sound-patching"
 version = "0.1.0"
 edition = "2024"
+description = "Node-based PipeWire patchbay and mixer"
+license = "MIT"
+repository = "https://github.com/Exouxas/better-sound-patching"
 rust-version = "1.95"
 
 [dependencies]

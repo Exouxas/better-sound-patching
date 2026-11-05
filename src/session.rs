@@ -167,9 +167,7 @@ fn launch_detached(cmd: &[String]) -> Result<()> {
 /// `activation` is the desktop's token for the click that asked for it (lets the new window
 /// take focus on Wayland).
 pub fn open_editor(activation: Option<String>) -> Result<()> {
-    // After an update replaced the file, Linux reports our own path with " (deleted)" on the
-    // end; the new program is at the plain path.
-    let exe = std::env::current_exe()?.to_string_lossy().trim_end_matches(" (deleted)").to_owned();
+    let exe = own_exe()?.to_string_lossy().into_owned();
     let via_systemd = Command::new("systemd-run")
         .args(["--user", "--collect", "--quiet"])
         .args(activation.iter().flat_map(|t| ["--setenv".to_owned(), format!("XDG_ACTIVATION_TOKEN={t}")]))
@@ -224,7 +222,7 @@ pub fn restore_paused() -> Result<Vec<String>> {
         let _ = std::fs::remove_file(paused_record());
         Ok(restored)
     } else {
-        // Keep the record so the GUI's restore button and `bsp restore` can try again.
+        // Keep the record so the GUI's restore button and `better-sound-patching restore` can try again.
         let names: Vec<_> = failed.iter().map(|a| a.name.clone()).collect();
         let _ = model::write_atomic(&paused_record(), &serde_json::to_string(&failed)?);
         bail!("could not relaunch {}", names.join(", "))
@@ -377,17 +375,50 @@ pub fn stop_daemon(restore: bool) -> Result<()> {
 // ---------------------------------------------------------------- approval
 
 const UNIT: &str = "better-sound-patching.service";
+const APP: &str = "better-sound-patching";
+/// Where a package puts the program; the shipped service and desktop files point here.
+const PACKAGED_BIN: &str = "/usr/bin/better-sound-patching";
 
+/// A service file in your own config, written by `approve` for a self-built copy. It hides
+/// a packaged one of the same name.
 fn unit_path() -> PathBuf {
     dirs::config_dir().unwrap_or_default().join("systemd/user").join(UNIT)
 }
 
+/// Where `approve` puts a self-built copy.
 fn installed_bin() -> PathBuf {
+    dirs::home_dir().unwrap_or_default().join(".local/bin").join(APP)
+}
+
+/// Where earlier versions put it (under the old short name).
+fn old_installed_bin() -> PathBuf {
     dirs::home_dir().unwrap_or_default().join(".local/bin/bsp")
 }
 
+fn desktop_entry_path() -> PathBuf {
+    dirs::data_dir().unwrap_or_default().join("applications").join(format!("{APP}.desktop"))
+}
+
+fn icon_path() -> PathBuf {
+    dirs::data_dir().unwrap_or_default().join("icons/hicolor/scalable/apps").join(format!("{APP}.svg"))
+}
+
+/// The running program, as a path (an update may have replaced the file: Linux then reports
+/// it with " (deleted)" on the end, and the new program is at the plain path).
+fn own_exe() -> Result<PathBuf> {
+    Ok(PathBuf::from(std::env::current_exe()?.to_string_lossy().trim_end_matches(" (deleted)")))
+}
+
+/// Installed by the system's package manager, which then owns the program, the service, the
+/// menu entry and the icon: `approve` only switches the service on.
+pub fn is_packaged() -> bool {
+    own_exe().is_ok_and(|p| p.starts_with("/usr/"))
+}
+
+/// Starts at login: the service is enabled (packaged or self-built).
 pub fn is_approved() -> bool {
-    unit_path().exists()
+    let wants = dirs::config_dir().unwrap_or_default().join("systemd/user/default.target.wants").join(UNIT);
+    wants.symlink_metadata().is_ok() || unit_path().exists()
 }
 
 fn systemctl(args: &[&str]) -> Result<()> {
@@ -398,18 +429,22 @@ fn systemctl(args: &[&str]) -> Result<()> {
     Ok(())
 }
 
-/// Make the new system permanent: install the binary and a user service that starts at
-/// login, and stop the given programs from autostarting (their entries are moved aside, not
-/// deleted, so `revert` can put them back).
+/// Make the new system permanent: start the daemon at login (as a systemd user service, with
+/// the tray icon), and stop the given programs from autostarting (their entries are moved
+/// aside, not deleted, so `revert` can put them back). A self-built copy installs itself to
+/// `~/.local/bin` with its own service and menu entry; a packaged one uses the package's.
 pub fn approve(disable: &[String]) -> Result<()> {
     if !model::graph_exists() {
         bail!("no routing graph yet; build and save one in the editor first");
     }
-    let bin = installed_bin();
-    std::fs::create_dir_all(bin.parent().unwrap())?;
-    let tmp = bin.with_extension("new");
-    std::fs::copy(std::env::current_exe()?, &tmp)?;
-    std::fs::rename(&tmp, &bin)?;
+    let packaged = is_packaged();
+    let bin = if packaged { own_exe()? } else { installed_bin() };
+    if !packaged {
+        std::fs::create_dir_all(bin.parent().unwrap())?;
+        let tmp = bin.with_extension("new");
+        std::fs::copy(own_exe()?, &tmp)?;
+        std::fs::rename(&tmp, &bin)?;
+    }
 
     if ipc::status().is_some() {
         stop_daemon(false)?;
@@ -426,34 +461,49 @@ pub fn approve(disable: &[String]) -> Result<()> {
         stop_process(name);
     }
 
-    let unit = format!(
-        "[Unit]\n\
-         Description=Better Sound Patching routing daemon\n\
-         After=pipewire.service wireplumber.service\n\
-         Requires=pipewire.service\n\
-         \n\
-         [Service]\n\
-         ExecStart={bin} daemon\n\
-         Restart=on-failure\n\
-         RestartSec=2\n\
-         \n\
-         [Install]\n\
-         WantedBy=default.target\n",
-        bin = bin.display()
-    );
-    std::fs::create_dir_all(unit_path().parent().unwrap())?;
-    model::write_atomic(&unit_path(), &unit)?;
+    if packaged {
+        // A self-built copy approved earlier would hide the package's files: remove it
+        // (disabled first, so its start-at-login link goes with it).
+        if unit_path().exists() {
+            let _ = systemctl(&["disable", UNIT]);
+        }
+        remove_self_built();
+    } else {
+        let unit = include_str!("../assets/better-sound-patching.service").replace(PACKAGED_BIN, &bin.to_string_lossy());
+        std::fs::create_dir_all(unit_path().parent().unwrap())?;
+        model::write_atomic(&unit_path(), &unit)?;
+        install_desktop_entry(&bin)?;
+        if old_installed_bin().exists() {
+            let _ = std::fs::remove_file(old_installed_bin());
+        }
+    }
     systemctl(&["daemon-reload"])?;
     systemctl(&["enable", "--now", UNIT])?;
-    install_desktop_entry(&bin)?;
     Ok(())
 }
 
-/// Undo `approve`: remove the service and restore the moved autostart entries.
+/// Remove what `approve` installed for a self-built copy: the program, its service, menu
+/// entry and icon.
+fn remove_self_built() {
+    for p in [installed_bin(), old_installed_bin(), unit_path(), desktop_entry_path(), icon_path()] {
+        if p.exists() {
+            match std::fs::remove_file(&p) {
+                Ok(()) => println!("removed {}", p.display()),
+                Err(e) => log::warn!("removing {}: {e}", p.display()),
+            }
+        }
+    }
+    icons_changed();
+}
+
+/// Undo `approve`: stop the service from starting at login and restore the moved autostart
+/// entries. A self-built copy's files are removed; a package's stay (the package owns them).
 pub fn revert() -> Result<()> {
-    if unit_path().exists() {
+    if is_approved() {
         let _ = systemctl(&["disable", "--now", UNIT]);
-        std::fs::remove_file(unit_path())?;
+        if unit_path().exists() {
+            std::fs::remove_file(unit_path())?;
+        }
         systemctl(&["daemon-reload"])?;
     } else if ipc::status().is_some() {
         stop_daemon(true)?;
@@ -485,18 +535,11 @@ pub fn revert() -> Result<()> {
 }
 
 fn install_desktop_entry(bin: &Path) -> Result<()> {
-    let icons = dirs::data_dir().unwrap_or_default().join("icons/hicolor/scalable/apps");
-    std::fs::create_dir_all(&icons)?;
-    model::write_atomic(&icons.join("better-sound-patching.svg"), include_str!("../assets/icon.svg"))?;
-    let dir = dirs::data_dir().unwrap_or_default().join("applications");
-    std::fs::create_dir_all(&dir)?;
-    let entry = format!(
-        "[Desktop Entry]\nType=Application\nName=Better Sound Patching\n\
-         Comment=Audio routing and mixer\nExec={} gui\nIcon=better-sound-patching\n\
-         Categories=AudioVideo;Audio;Mixer;\n",
-        bin.display()
-    );
-    model::write_atomic(&dir.join("better-sound-patching.desktop"), &entry)?;
+    std::fs::create_dir_all(icon_path().parent().unwrap())?;
+    model::write_atomic(&icon_path(), include_str!("../assets/icon.svg"))?;
+    std::fs::create_dir_all(desktop_entry_path().parent().unwrap())?;
+    let entry = include_str!("../assets/better-sound-patching.desktop").replace(PACKAGED_BIN, &bin.to_string_lossy());
+    model::write_atomic(&desktop_entry_path(), &entry)?;
     icons_changed();
     Ok(())
 }

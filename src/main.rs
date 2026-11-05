@@ -15,7 +15,7 @@ use anyhow::{Result, bail};
 use clap::{Parser, Subcommand};
 
 #[derive(Parser)]
-#[command(name = "bsp", about = "Node-based PipeWire routing that just works")]
+#[command(name = "better-sound-patching", about = "Node-based PipeWire routing that just works")]
 struct Cli {
     #[command(subcommand)]
     cmd: Option<Cmd>,
@@ -39,13 +39,13 @@ enum Cmd {
     },
     /// Stop the daemon and give control back to your old setup.
     Stop,
-    /// Make a switch node use one of its pins, e.g. `bsp select Output 2`.
+    /// Make a switch node use one of its pins, e.g. `better-sound-patching select Output 2`.
     Select {
         switch: String,
         /// Pin number as shown in the editor (1 = first).
         pin: u32,
     },
-    /// Act as if a switch shortcut was pressed: selects every pin bound to it, e.g. `bsp key Ctrl+Alt+1`.
+    /// Act as if a switch shortcut was pressed: selects every pin bound to it, e.g. `better-sound-patching key Ctrl+Alt+1`.
     Key { key: String },
     /// Show daemon status.
     Status,
@@ -64,7 +64,7 @@ enum Cmd {
 }
 
 fn main() -> Result<()> {
-    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("warn,bsp=info")).init();
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("warn,better_sound_patching=info")).init();
     let cli = Cli::parse();
     match cli.cmd.unwrap_or(Cmd::Gui) {
         Cmd::Gui => gui::run(),
@@ -72,7 +72,7 @@ fn main() -> Result<()> {
         Cmd::Trial { pause } => {
             let pause = if pause.is_empty() { session::default_conflicts() } else { pause };
             session::start_trial(&pause)?;
-            println!("trial running (paused: {}). `bsp stop` (or a reboot) brings your old setup back", pause.join(", "));
+            println!("trial running (paused: {}). `better-sound-patching stop` (or a reboot) brings your old setup back", pause.join(", "));
             Ok(())
         }
         Cmd::Stop => session::stop_daemon(true),

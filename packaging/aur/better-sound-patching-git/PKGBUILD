@@ -1,0 +1,75 @@
+# Maintainer: Christoffer Aske <christoffer.aske@gmail.com>
+
+pkgname=better-sound-patching-git
+_pkgname=better-sound-patching
+pkgver=0.1.0.r0.g0000000
+pkgrel=1
+pkgdesc='Node-based PipeWire patchbay and mixer'
+arch=('x86_64')
+url='https://github.com/Exouxas/better-sound-patching'
+license=('MIT')
+depends=(
+  'gcc-libs'
+  'glibc'
+  'hicolor-icon-theme'
+  'libglvnd'
+  'libpipewire'
+  'libxkbcommon'
+  'pipewire'
+  'systemd'
+  'util-linux'
+  'vulkan-icd-loader'
+  'wayland'
+  'wireplumber'
+)
+makedepends=('cargo' 'clang' 'git')
+optdepends=(
+  'libx11: X11 sessions'
+  'libxcursor: X11 sessions'
+  'libxi: X11 sessions'
+  'libxkbcommon-x11: X11 sessions'
+  'libxrandr: X11 sessions'
+)
+provides=("$_pkgname")
+conflicts=("$_pkgname")
+install="$_pkgname.install"
+source=("git+$url.git")
+sha256sums=('SKIP')
+
+pkgver() {
+  cd "$_pkgname"
+  printf '%s.r%s.g%s' \
+    "$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n1)" \
+    "$(git rev-list --count HEAD)" \
+    "$(git rev-parse --short=7 HEAD)"
+}
+
+prepare() {
+  cd "$_pkgname"
+  export RUSTUP_TOOLCHAIN=stable
+  cargo fetch --locked --target "$(rustc --print host-tuple)"
+}
+
+build() {
+  cd "$_pkgname"
+  export RUSTUP_TOOLCHAIN=stable
+  export CARGO_TARGET_DIR=target
+  cargo build --frozen --release
+}
+
+check() {
+  cd "$_pkgname"
+  export RUSTUP_TOOLCHAIN=stable
+  export CARGO_TARGET_DIR=target
+  cargo test --frozen --release
+}
+
+package() {
+  cd "$_pkgname"
+  install -Dm0755 -t "$pkgdir/usr/bin/" "target/release/$_pkgname"
+  install -Dm0644 -t "$pkgdir/usr/lib/systemd/user/" "assets/$_pkgname.service"
+  install -Dm0644 -t "$pkgdir/usr/share/applications/" "assets/$_pkgname.desktop"
+  install -Dm0644 assets/icon.svg "$pkgdir/usr/share/icons/hicolor/scalable/apps/$_pkgname.svg"
+  install -Dm0644 -t "$pkgdir/usr/share/licenses/$pkgname/" LICENSE
+  install -Dm0644 -t "$pkgdir/usr/share/doc/$pkgname/" README.md
+}

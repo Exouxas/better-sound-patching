@@ -1,0 +1,12 @@
+[Unit]
+Description=Better Sound Patching routing daemon
+After=pipewire.service wireplumber.service
+Requires=pipewire.service
+
+[Service]
+ExecStart=/usr/bin/better-sound-patching daemon
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=default.target
