@@ -5,7 +5,8 @@ use crate::ipc::Request;
 use ksni::blocking::TrayMethods;
 use ksni::menu::StandardItem;
 use ksni::{MenuItem, Orientation, ToolTip};
-use std::sync::mpsc;
+use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::{mpsc, Arc};
 
 /// One scroll notch (the host reports 120 per notch) changes the master by this much.
 const STEP: f32 = 0.05;
@@ -15,31 +16,55 @@ pub struct Tray {
     /// Scroll not yet turned into a step (touchpads send small amounts).
     scrolled: i32,
     engine: pipewire::channel::Sender<Cmd>,
+    /// The master volume the icon shows, as `f32` bits. Shared with the updater thread so a
+    /// change the tray made itself isn't sent back to it.
+    shown: Arc<AtomicU32>,
 }
 
-pub type Handle = ksni::blocking::Handle<Tray>;
-
-/// Show the tray icon. Returns `None` if the desktop has no tray.
-pub fn spawn(engine: pipewire::channel::Sender<Cmd>) -> Option<Handle> {
-    let tray = Tray { master: 1.0, scrolled: 0, engine };
-    match tray.spawn() {
-        Ok(h) => Some(h),
+/// Show the tray icon. Returns `None` if the desktop has no tray; otherwise a function that
+/// shows a new master volume on the icon.
+///
+/// The function never waits: updating a ksni tray blocks until its D-Bus service has handled
+/// the update, and that can hang while the service is busy (a scroll that came in at the same
+/// moment). A dedicated thread does the update instead, so the caller (the PipeWire loop) can
+/// never get stuck behind the tray.
+pub fn spawn(engine: pipewire::channel::Sender<Cmd>) -> Option<Box<dyn Fn(f32)>> {
+    let shown = Arc::new(AtomicU32::new(1.0f32.to_bits()));
+    let tray = Tray { master: 1.0, scrolled: 0, engine, shown: shown.clone() };
+    let handle = match tray.spawn() {
+        Ok(h) => h,
         Err(e) => {
             log::warn!("no tray icon: {e}");
-            None
+            return None;
         }
+    };
+    let (tx, rx) = mpsc::channel::<f32>();
+    let spawned = std::thread::Builder::new().name("tray-update".into()).spawn(move || {
+        while let Ok(mut master) = rx.recv() {
+            // Only the latest value matters.
+            while let Ok(newer) = rx.try_recv() {
+                master = newer;
+            }
+            if shown.load(Ordering::Relaxed) == master.to_bits() {
+                continue;
+            }
+            shown.store(master.to_bits(), Ordering::Relaxed);
+            handle.update(|t| t.master = master);
+        }
+    });
+    if let Err(e) = spawned {
+        log::warn!("no tray icon: {e}");
+        return None;
     }
+    Some(Box::new(move |m| {
+        let _ = tx.send(m);
+    }))
 }
 
 fn open() {
     if let Err(e) = crate::session::open_editor(ksni::current_xdg_activation_token()) {
         log::warn!("opening the editor: {e:#}");
     }
-}
-
-/// Tell the tray the master volume changed elsewhere (the editor, or at start).
-pub fn show_master(handle: &Handle, master: f32) {
-    handle.update(|t| t.master = master);
 }
 
 impl Tray {
@@ -49,6 +74,7 @@ impl Tray {
             return;
         }
         self.master = v;
+        self.shown.store(v.to_bits(), Ordering::Relaxed);
         let (reply, _) = mpsc::channel();
         let _ = self.engine.send(Cmd::Ipc(Request::Master { volume: v }, reply));
     }

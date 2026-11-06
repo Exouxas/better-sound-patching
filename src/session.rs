@@ -316,7 +316,7 @@ pub fn run_daemon(pause: &[String]) -> Result<()> {
             on_snapshot: Box::new(|_| {}),
             paused: paused.iter().map(|p| p.name.clone()).collect(),
             hotkeys,
-            on_master: tray.map(|h| Box::new(move |m: f32| crate::tray::show_master(&h, m)) as Box<dyn Fn(f32)>),
+            on_master: tray,
         },
         rx,
     );
