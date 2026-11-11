@@ -21,8 +21,12 @@ pub struct Tray {
     shown: Arc<AtomicU32>,
 }
 
-/// Show the tray icon. Returns `None` if the desktop has no tray; otherwise a function that
-/// shows a new master volume on the icon.
+/// Show the tray icon. Returns `None` if there's no session bus to put it on; otherwise a
+/// function that shows a new master volume on the icon.
+///
+/// The daemon can start before the desktop's tray does (a user service that comes up before
+/// Plasma), so a missing tray isn't an error: the icon waits and registers once the tray
+/// appears, and again if the tray restarts.
 ///
 /// The function never waits: updating a ksni tray blocks until its D-Bus service has handled
 /// the update, and that can hang while the service is busy (a scroll that came in at the same
@@ -31,7 +35,7 @@ pub struct Tray {
 pub fn spawn(engine: pipewire::channel::Sender<Cmd>) -> Option<Box<dyn Fn(f32)>> {
     let shown = Arc::new(AtomicU32::new(1.0f32.to_bits()));
     let tray = Tray { master: 1.0, scrolled: 0, engine, shown: shown.clone() };
-    let handle = match tray.spawn() {
+    let handle = match tray.assume_sni_available(true).spawn() {
         Ok(h) => h,
         Err(e) => {
             log::warn!("no tray icon: {e}");
@@ -87,6 +91,15 @@ impl ksni::Tray for Tray {
 
     fn title(&self) -> String {
         "Better Sound Patching".into()
+    }
+
+    fn watcher_offline(&self, reason: ksni::OfflineReason) -> bool {
+        log::info!("tray not available yet, the icon will appear when it is ({reason:?})");
+        true
+    }
+
+    fn watcher_online(&self) {
+        log::info!("tray is back, showing the icon");
     }
 
     fn category(&self) -> ksni::Category {
