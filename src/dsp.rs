@@ -211,7 +211,7 @@ pub enum Params {
     Eq(EqParams),
     Levels { gate: Option<f32>, limit: Option<f32> },
     Volume { gain: f32 },
-    Denoise { reduction_db: f32 },
+    Denoise { reduction_db: f32, enabled: bool },
 }
 
 impl Params {
@@ -223,7 +223,7 @@ impl Params {
                 limit: l.limit_on.then(|| db_to_lin(l.limit_db)),
             },
             FilterSpec::Volume(v) => Params::Volume { gain: v.gain.clamp(0.0, crate::model::MAX_VOLUME) },
-            FilterSpec::Denoise(d) => Params::Denoise { reduction_db: d.reduction_db },
+            FilterSpec::Denoise(d) => Params::Denoise { reduction_db: d.reduction_db, enabled: d.enabled },
         }
     }
 }
@@ -266,8 +266,9 @@ impl Processor {
                 c.set(p, rate as f64);
             }
         }
-        if let (Params::Denoise { reduction_db }, Some(d)) = (params, &mut self.denoiser) {
+        if let (Params::Denoise { reduction_db, enabled }, Some(d)) = (params, &mut self.denoiser) {
             d.set_reduction(reduction_db);
+            d.set_enabled(enabled);
         }
     }
 

@@ -213,11 +213,14 @@ pub struct DenoiseSpec {
     /// some noise; [`DENOISE_FULL_DB`] and above don't limit it.
     #[serde(default = "full_reduction")]
     pub reduction_db: f32,
+    /// Off passes the audio unchanged (still delayed the same, so nothing shifts in time).
+    #[serde(default = "yes")]
+    pub enabled: bool,
 }
 
 impl DenoiseSpec {
     pub fn new(name: &str) -> Self {
-        DenoiseSpec { name: name.into(), channels: Channels::Mono, model: DenoiseModel::default(), reduction_db: DENOISE_FULL_DB }
+        DenoiseSpec { name: name.into(), channels: Channels::Mono, model: DenoiseModel::default(), reduction_db: DENOISE_FULL_DB, enabled: true }
     }
 }
 
@@ -798,7 +801,7 @@ mod tests {
                 GraphNode {
                     id: 9,
                     pos: [0.0, 0.0],
-                    kind: NodeKind::Denoise(DenoiseSpec { model: DenoiseModel::RnNoise, reduction_db: 24.0, ..DenoiseSpec::new("denoise-1") }),
+                    kind: NodeKind::Denoise(DenoiseSpec { model: DenoiseModel::RnNoise, reduction_db: 24.0, enabled: false, ..DenoiseSpec::new("denoise-1") }),
                 },
                 GraphNode {
                     id: 6,

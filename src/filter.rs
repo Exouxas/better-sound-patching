@@ -135,7 +135,7 @@ impl FilterNode {
         let shared = Arc::new(Shared { generation: AtomicU64::new(1), params: Mutex::new(params), meter: Meter::new() });
         let mut proc = Processor::new(params);
         if let FilterSpec::Denoise(d) = spec {
-            proc = proc.with_denoiser(Denoiser::new(d.model, channels.len(), d.reduction_db)?);
+            proc = proc.with_denoiser(Denoiser::new(d.model, channels.len(), d.reduction_db, d.enabled)?);
         }
         let rt = Box::new(Rt {
             ins: vec![],

@@ -24,10 +24,7 @@ const I16: f32 = 32768.0;
 enum Engine {
     RnNoise {
         states: Vec<Box<DenoiseState<'static>>>,
-        /// The previous input frame per channel: RNNoise's output is one frame behind its input,
-        /// and this is what gets mixed back in to limit the reduction.
-        dry: [[f32; HOP]; MAX_CH],
-        /// How much of the dry signal is mixed back (0 = none).
+        /// How much of the dry signal is mixed back to limit the reduction (0 = none).
         mix: f32,
     },
     DeepFilter { df: Box<DfTract>, noisy: Array2<f32>, enhanced: Array2<f32> },
@@ -40,20 +37,46 @@ pub struct Denoiser {
     pos: usize,
     input: [[f32; HOP]; MAX_CH],
     output: [[f32; HOP]; MAX_CH],
+    /// The model's own delay in samples (a multiple of [`HOP`]).
+    delay: usize,
+    /// Recent input per channel, `delay + HOP` long, for the dry signal lined up with the model's
+    /// output. `dry_at` is where the current frame starts.
+    dry: Vec<Vec<f32>>,
+    dry_at: usize,
+    /// Switched off: how much of the dry signal plays (1 = only dry), easing towards the target
+    /// over one frame so switching doesn't click. The model keeps running, so it's ready when
+    /// switched back on, and the delay stays the same either way.
+    bypass: f32,
+    bypass_target: f32,
 }
 
 impl Denoiser {
-    pub fn new(model: DenoiseModel, channels: usize, reduction_db: f32) -> anyhow::Result<Denoiser> {
+    pub fn new(model: DenoiseModel, channels: usize, reduction_db: f32, enabled: bool) -> anyhow::Result<Denoiser> {
         let ch = channels.clamp(1, MAX_CH);
-        let engine = match model {
-            DenoiseModel::RnNoise => Engine::RnNoise { states: (0..ch).map(|_| DenoiseState::new()).collect(), dry: [[0.0; HOP]; MAX_CH], mix: 0.0 },
+        let (engine, delay) = match model {
+            // RNNoise's output is one frame behind its input.
+            DenoiseModel::RnNoise => (Engine::RnNoise { states: (0..ch).map(|_| DenoiseState::new()).collect(), mix: 0.0 }, HOP),
             DenoiseModel::DeepFilterNet => {
                 let df = DfTract::new(DfParams::default(), &RuntimeParams::default_with_ch(ch))?;
                 anyhow::ensure!(df.hop_size == HOP && df.sr as f32 == RATE, "unexpected DeepFilterNet frame size or rate");
-                Engine::DeepFilter { df: Box::new(df), noisy: Array2::zeros((ch, HOP)), enhanced: Array2::zeros((ch, HOP)) }
+                let delay = df.delay();
+                anyhow::ensure!(delay % HOP == 0, "unexpected DeepFilterNet delay {delay}");
+                (Engine::DeepFilter { df: Box::new(df), noisy: Array2::zeros((ch, HOP)), enhanced: Array2::zeros((ch, HOP)) }, delay)
             }
         };
-        let mut d = Denoiser { engine, ch, pos: 0, input: [[0.0; HOP]; MAX_CH], output: [[0.0; HOP]; MAX_CH] };
+        let off = if enabled { 0.0 } else { 1.0 };
+        let mut d = Denoiser {
+            engine,
+            ch,
+            pos: 0,
+            input: [[0.0; HOP]; MAX_CH],
+            output: [[0.0; HOP]; MAX_CH],
+            delay,
+            dry: vec![vec![0.0; delay + HOP]; ch],
+            dry_at: 0,
+            bypass: off,
+            bypass_target: off,
+        };
         d.set_reduction(reduction_db);
         Ok(d)
     }
@@ -65,6 +88,11 @@ impl Denoiser {
             Engine::RnNoise { mix, .. } => *mix = if db >= DENOISE_FULL_DB { 0.0 } else { 10f32.powf(-db / 20.0) },
             Engine::DeepFilter { df, .. } => df.set_atten_lim(db.min(DENOISE_FULL_DB)),
         }
+    }
+
+    /// Off passes the audio unchanged, but delayed the same, so switching doesn't move it in time.
+    pub fn set_enabled(&mut self, on: bool) {
+        self.bypass_target = if on { 0.0 } else { 1.0 };
     }
 
     /// `ins` and `outs` have one slice per channel, all the same length. The output is the input
@@ -87,18 +115,24 @@ impl Denoiser {
 
     fn run_frame(&mut self) {
         let ch = self.ch;
+        let len = self.delay + HOP;
+        for c in 0..ch {
+            self.dry[c][self.dry_at..self.dry_at + HOP].copy_from_slice(&self.input[c]);
+        }
+        // The dry sample lined up with output sample `j`.
+        let start = (self.dry_at + len - self.delay) % len;
+        let dry = |c: usize, j: usize, d: &Vec<Vec<f32>>| d[c][(start + j) % len];
         match &mut self.engine {
-            Engine::RnNoise { states, dry, mix } => {
+            Engine::RnNoise { states, mix } => {
                 let (mut x, mut y) = ([0f32; HOP], [0f32; HOP]);
                 for c in 0..ch {
                     for (x, v) in x.iter_mut().zip(&self.input[c]) {
                         *x = v * I16;
                     }
                     states[c].process_frame(&mut y, &x);
-                    for ((o, y), d) in self.output[c].iter_mut().zip(&y).zip(&dry[c]) {
-                        *o = y / I16 * (1.0 - *mix) + d * *mix;
+                    for j in 0..HOP {
+                        self.output[c][j] = y[j] / I16 * (1.0 - *mix) + dry(c, j, &self.dry) * *mix;
                     }
-                    dry[c] = self.input[c];
                 }
             }
             Engine::DeepFilter { df, noisy, enhanced } => {
@@ -107,11 +141,27 @@ impl Denoiser {
                 }
                 let ok = df.process(noisy.view(), enhanced.view_mut()).is_ok();
                 for c in 0..ch {
-                    let src = if ok { enhanced.row(c) } else { noisy.row(c) };
-                    self.output[c].copy_from_slice(src.as_slice().unwrap());
+                    for j in 0..HOP {
+                        self.output[c][j] = if ok { enhanced[[c, j]] } else { dry(c, j, &self.dry) };
+                    }
                 }
             }
         }
+        if self.bypass > 0.0 || self.bypass_target > 0.0 {
+            let step = 1.0 / HOP as f32;
+            for j in 0..HOP {
+                self.bypass = if self.bypass < self.bypass_target {
+                    (self.bypass + step).min(self.bypass_target)
+                } else {
+                    (self.bypass - step).max(self.bypass_target)
+                };
+                for c in 0..ch {
+                    let o = &mut self.output[c][j];
+                    *o += (dry(c, j, &self.dry) - *o) * self.bypass;
+                }
+            }
+        }
+        self.dry_at = (self.dry_at + HOP) % len;
         for o in self.output[..ch].iter_mut().flatten() {
             if !o.is_finite() {
                 *o = 0.0;
@@ -160,7 +210,7 @@ mod tests {
         for model in DenoiseModel::ALL {
             assert_eq!(delay(model) as u32 * 1000 / RATE as u32, model.delay_ms(), "{model:?}");
             // With no reduction the output is exactly the input, delayed.
-            let mut d = Denoiser::new(model, 1, 0.0).unwrap();
+            let mut d = Denoiser::new(model, 1, 0.0, true).unwrap();
             let input = hiss(48000, 0.1);
             let out = run(&mut d, &input);
             let k = delay(model);
@@ -170,11 +220,34 @@ mod tests {
     }
 
     #[test]
+    fn switching_off_passes_the_input_with_the_same_delay_and_no_jump() {
+        for model in DenoiseModel::ALL {
+            let mut d = Denoiser::new(model, 1, DENOISE_FULL_DB, false).unwrap();
+            let input = hiss(48000, 0.1);
+            let out = run(&mut d, &input);
+            let k = delay(model);
+            let err = (k..input.len()).map(|i| (out[i] - input[i - k]).abs()).fold(0f32, f32::max);
+            assert!(err < 1e-6, "{model:?}: off but changed by {err}");
+            // Switching fades over a frame. A smooth 100 Hz tone, which the models remove, moves
+            // at most 0.007 per sample; switching without a fade would jump by up to 0.5.
+            let tone: Vec<f32> = (0..48000).map(|i| 0.5 * (i as f32 * 100.0 * std::f32::consts::TAU / RATE).sin()).collect();
+            let mut d = Denoiser::new(model, 1, DENOISE_FULL_DB, false).unwrap();
+            let mut joined = run(&mut d, &tone);
+            for on in [true, false] {
+                d.set_enabled(on);
+                joined.extend(run(&mut d, &tone));
+            }
+            let jump = joined.windows(2).map(|w| (w[1] - w[0]).abs()).fold(0f32, f32::max);
+            assert!(jump < 0.05, "{model:?}: jump of {jump}");
+        }
+    }
+
+    #[test]
     fn both_models_remove_hiss() {
         // RNNoise adapts to steady hiss over seconds and stays weak against it; DeepFilterNet
         // removes nearly all of it.
         for (model, at_least_db) in [(DenoiseModel::DeepFilterNet, 20.0), (DenoiseModel::RnNoise, 6.0)] {
-            let mut d = Denoiser::new(model, 1, DENOISE_FULL_DB).unwrap();
+            let mut d = Denoiser::new(model, 1, DENOISE_FULL_DB, true).unwrap();
             let noise = hiss(48000 * 6, 0.02);
             let out = run(&mut d, &noise);
             let db = 20.0 * (rms(&out[48000 * 5..]) / rms(&noise[48000 * 5..])).log10();
@@ -186,7 +259,7 @@ mod tests {
     fn a_reduction_limit_lets_some_noise_through() {
         for model in DenoiseModel::ALL {
             let noise = hiss(48000 * 6, 0.02);
-            let mut d = Denoiser::new(model, 1, 6.0).unwrap();
+            let mut d = Denoiser::new(model, 1, 6.0, true).unwrap();
             let out = run(&mut d, &noise);
             let db = 20.0 * (rms(&out[48000 * 5..]) / rms(&noise[48000 * 5..])).log10();
             assert!(db > -6.5, "{model:?}: limited to 6 dB but {db:.1} dB down");
@@ -196,7 +269,7 @@ mod tests {
     #[test]
     fn stereo_and_silence_stay_finite() {
         for model in DenoiseModel::ALL {
-            let mut d = Denoiser::new(model, 2, DENOISE_FULL_DB).unwrap();
+            let mut d = Denoiser::new(model, 2, DENOISE_FULL_DB, true).unwrap();
             let n = 256 * 200;
             let zeros = vec![0.0; n];
             let (mut l, mut r) = (vec![1.0; n], vec![1.0; n]);

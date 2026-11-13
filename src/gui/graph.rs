@@ -527,6 +527,7 @@ impl SnarlViewer<NodeKind> for Viewer<'_> {
             NodeKind::SwitchInput { .. } => "Input switch".into(),
             NodeKind::Levels(_) => "Levels".into(),
             NodeKind::Volume(_) => "Volume".into(),
+            NodeKind::Denoise(d) if !d.enabled => "Noise suppression · off".into(),
             NodeKind::Denoise(_) => "Noise suppression".into(),
         }
     }
@@ -991,6 +992,9 @@ fn volume_editor(ui: &mut Ui, v: &mut VolumeSpec, reading: Option<Reading>) {
 /// Noise suppression: the model, how far it may turn the noise down, and in/out meters.
 fn denoise_editor(ui: &mut Ui, d: &mut DenoiseSpec, reading: Option<Reading>) {
     ui.horizontal(|ui| {
+        ui.checkbox(&mut d.enabled, "On")
+            .on_hover_text("Off lets the audio through unchanged, with the same delay, so switching doesn't make it jump.");
+        ui.separator();
         for (c, label) in [(Channels::Mono, "Mono"), (Channels::Stereo, "Stereo")] {
             if ui.selectable_label(d.channels == c, label).clicked() {
                 d.channels = c;
