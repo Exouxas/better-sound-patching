@@ -1,1 +1,8 @@
 /target
+
+# makepkg leftovers (packaging/aur/*/): sources, package, and the kept cargo cache
+packaging/aur/*/target/
+packaging/aur/*/src/
+packaging/aur/*/pkg/
+packaging/aur/*/better-sound-patching/
+packaging/aur/*/*.pkg.tar.*

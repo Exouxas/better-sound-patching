@@ -51,23 +51,30 @@ prepare() {
   cargo fetch --locked --target "$(rustc --print host-tuple)"
 }
 
+# Cargo's build cache lives next to this file, not in src/: paru builds with makepkg -c, which
+# deletes src/ afterwards, and with it everything cargo compiled. Kept here, an update only
+# recompiles what changed. Delete the target folder here to start over.
+# Cargo runs without SOURCE_DATE_EPOCH: makepkg sets it to the time of each run, and C build
+# scripts (tract-linalg, libspa-sys) rerun when it changes, taking everything after them along.
+_target="$startdir/target"
+
 build() {
   cd "$_pkgname"
   export RUSTUP_TOOLCHAIN=stable
-  export CARGO_TARGET_DIR=target
-  cargo build --frozen --release
+  export CARGO_TARGET_DIR="$_target"
+  env -u SOURCE_DATE_EPOCH cargo build --frozen --release
 }
 
 check() {
   cd "$_pkgname"
   export RUSTUP_TOOLCHAIN=stable
-  export CARGO_TARGET_DIR=target
-  cargo test --frozen --release
+  export CARGO_TARGET_DIR="$_target"
+  env -u SOURCE_DATE_EPOCH cargo test --frozen --release
 }
 
 package() {
   cd "$_pkgname"
-  install -Dm0755 -t "$pkgdir/usr/bin/" "target/release/$_pkgname"
+  install -Dm0755 -t "$pkgdir/usr/bin/" "$_target/release/$_pkgname"
   install -Dm0644 -t "$pkgdir/usr/lib/systemd/user/" "assets/$_pkgname.service"
   install -Dm0644 -t "$pkgdir/usr/share/applications/" "assets/$_pkgname.desktop"
   install -Dm0644 assets/icon.svg "$pkgdir/usr/share/icons/hicolor/scalable/apps/$_pkgname.svg"
