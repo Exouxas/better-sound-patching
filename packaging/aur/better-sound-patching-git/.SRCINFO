@@ -16,6 +16,7 @@ pkgbase = better-sound-patching-git
 	depends = libpipewire
 	depends = libxkbcommon
 	depends = pipewire
+	depends = rnnoise
 	depends = systemd
 	depends = util-linux
 	depends = vulkan-icd-loader

@@ -16,6 +16,7 @@ depends=(
   'libpipewire'
   'libxkbcommon'
   'pipewire'
+  'rnnoise'
   'systemd'
   'util-linux'
   'vulkan-icd-loader'

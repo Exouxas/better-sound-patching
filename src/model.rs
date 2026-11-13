@@ -165,16 +165,16 @@ pub const MAX_VOLUME: f32 = 10.0;
 /// Which neural network removes the noise. Both run on the CPU inside the daemon.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub enum DenoiseModel {
-    /// DeepFilterNet 3: the better one, also with keyboards and voices in the background.
-    /// About 40 ms of delay.
-    #[default]
+    /// DeepFilterNet 3: 40 ms of delay. Can sound muffled with headset mics that only record
+    /// up to 8 kHz (16 kHz sample rate), as its model expects full-band audio.
     DeepFilterNet,
-    /// RNNoise: lighter and quicker (about 20 ms of delay), but lets more noise through.
+    /// RNNoise 0.2 (the system's librnnoise): light, 20 ms of delay, keeps the voice natural.
+    #[default]
     RnNoise,
 }
 
 impl DenoiseModel {
-    pub const ALL: [DenoiseModel; 2] = [DenoiseModel::DeepFilterNet, DenoiseModel::RnNoise];
+    pub const ALL: [DenoiseModel; 2] = [DenoiseModel::RnNoise, DenoiseModel::DeepFilterNet];
     pub fn label(self) -> &'static str {
         match self {
             DenoiseModel::DeepFilterNet => "DeepFilterNet 3",

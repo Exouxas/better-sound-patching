@@ -1,5 +1,6 @@
 //! Noise suppression with a neural network: DeepFilterNet 3 (`deep-filter-rt`, MIT or Apache-2.0,
-//! model embedded) or RNNoise (`nnnoiseless`, BSD-3-Clause). Both work on 10 ms frames of 48 kHz
+//! model embedded) or RNNoise 0.2 (Xiph's `librnnoise`, BSD-3-Clause, the system library with the
+//! models retrained in 2024). Both work on 10 ms frames of 48 kHz
 //! audio, so audio is gathered into frames first, which adds one frame of delay on top of the
 //! model's own.
 //!
@@ -11,7 +12,56 @@ use crate::dsp::MAX_CH;
 use crate::model::{DENOISE_FULL_DB, DenoiseModel};
 use deep_filter_rt::tract::{DfParams, DfTract, RuntimeParams};
 use ndarray::Array2;
-use nnnoiseless::DenoiseState;
+use std::ptr::NonNull;
+
+/// The system's `librnnoise` (0.2 or newer).
+mod ffi {
+    use std::ffi::{c_int, c_void};
+
+    #[repr(C)]
+    pub struct DenoiseState {
+        _private: [u8; 0],
+    }
+
+    #[link(name = "rnnoise")]
+    unsafe extern "C" {
+        pub fn rnnoise_get_frame_size() -> c_int;
+        /// A null model means the built-in one.
+        pub fn rnnoise_create(model: *mut c_void) -> *mut DenoiseState;
+        pub fn rnnoise_destroy(st: *mut DenoiseState);
+        /// Returns the probability that the frame has voice in it.
+        pub fn rnnoise_process_frame(st: *mut DenoiseState, out: *mut f32, input: *const f32) -> f32;
+    }
+}
+
+/// One channel's RNNoise state.
+struct RnNoise(NonNull<ffi::DenoiseState>);
+
+// SAFETY: the state is plain memory owned by this value alone; it's only used from one thread at a time.
+unsafe impl Send for RnNoise {}
+
+impl RnNoise {
+    fn new() -> anyhow::Result<RnNoise> {
+        // SAFETY: plain calls into the library; a null model selects the built-in one.
+        unsafe {
+            let frame = ffi::rnnoise_get_frame_size();
+            anyhow::ensure!(frame as usize == HOP, "librnnoise works on frames of {frame} samples, not {HOP}");
+            NonNull::new(ffi::rnnoise_create(std::ptr::null_mut())).map(RnNoise).ok_or_else(|| anyhow::anyhow!("rnnoise_create failed"))
+        }
+    }
+
+    fn process(&mut self, out: &mut [f32; HOP], input: &[f32; HOP]) -> f32 {
+        // SAFETY: both buffers hold exactly one frame, checked against the library in `new`.
+        unsafe { ffi::rnnoise_process_frame(self.0.as_ptr(), out.as_mut_ptr(), input.as_ptr()) }
+    }
+}
+
+impl Drop for RnNoise {
+    fn drop(&mut self) {
+        // SAFETY: made by rnnoise_create and freed only here.
+        unsafe { ffi::rnnoise_destroy(self.0.as_ptr()) }
+    }
+}
 
 /// Samples per frame (10 ms at 48 kHz), the same for both models.
 pub const HOP: usize = 480;
@@ -23,7 +73,7 @@ const I16: f32 = 32768.0;
 
 enum Engine {
     RnNoise {
-        states: Vec<Box<DenoiseState<'static>>>,
+        states: Vec<RnNoise>,
         /// How much of the dry signal is mixed back to limit the reduction (0 = none).
         mix: f32,
     },
@@ -55,7 +105,7 @@ impl Denoiser {
         let ch = channels.clamp(1, MAX_CH);
         let (engine, delay) = match model {
             // RNNoise's output is one frame behind its input.
-            DenoiseModel::RnNoise => (Engine::RnNoise { states: (0..ch).map(|_| DenoiseState::new()).collect(), mix: 0.0 }, HOP),
+            DenoiseModel::RnNoise => (Engine::RnNoise { states: (0..ch).map(|_| RnNoise::new()).collect::<anyhow::Result<_>>()?, mix: 0.0 }, HOP),
             DenoiseModel::DeepFilterNet => {
                 let df = DfTract::new(DfParams::default(), &RuntimeParams::default_with_ch(ch))?;
                 anyhow::ensure!(df.hop_size == HOP && df.sr as f32 == RATE, "unexpected DeepFilterNet frame size or rate");
@@ -129,7 +179,7 @@ impl Denoiser {
                     for (x, v) in x.iter_mut().zip(&self.input[c]) {
                         *x = v * I16;
                     }
-                    states[c].process_frame(&mut y, &x);
+                    states[c].process(&mut y, &x);
                     for j in 0..HOP {
                         self.output[c][j] = y[j] / I16 * (1.0 - *mix) + dry(c, j, &self.dry) * *mix;
                     }
@@ -244,9 +294,8 @@ mod tests {
 
     #[test]
     fn both_models_remove_hiss() {
-        // RNNoise adapts to steady hiss over seconds and stays weak against it; DeepFilterNet
-        // removes nearly all of it.
-        for (model, at_least_db) in [(DenoiseModel::DeepFilterNet, 20.0), (DenoiseModel::RnNoise, 6.0)] {
+        // RNNoise 0.2 takes it down 50 dB or more; the 2018 model managed about 10.
+        for (model, at_least_db) in [(DenoiseModel::DeepFilterNet, 20.0), (DenoiseModel::RnNoise, 40.0)] {
             let mut d = Denoiser::new(model, 1, DENOISE_FULL_DB, true).unwrap();
             let noise = hiss(48000 * 6, 0.02);
             let out = run(&mut d, &noise);
