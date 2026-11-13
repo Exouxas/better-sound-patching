@@ -6,6 +6,7 @@ pkgbase = better-sound-patching-git
 	install = better-sound-patching.install
 	arch = x86_64
 	license = MIT
+	license = Apache-2.0
 	makedepends = cargo
 	makedepends = clang
 	makedepends = git

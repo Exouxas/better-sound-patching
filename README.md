@@ -30,8 +30,8 @@ It is written entirely in Rust with a native GUI. There is no Electron, no web v
   terminal, or with a **global keyboard shortcut**. Pins on different switches that share a key change
   together, so one key can move both output and mic to your VR headset.
 - **Built-in processing.** A parametric **EQ** with a draggable curve, a **Levels** node (meters, noise
-  gate, limiter), a **Volume** node and **noise suppression** (RNNoise 0.2 or DeepFilterNet 3, a
-  stand-in for Discord's Krisp) all run inside the daemon on PipeWire's realtime thread.
+  gate, limiter), a **Volume** node and **noise suppression** (RNNoise 0.2, DeepFilterNet 3 or
+  DPDFNet 2, a stand-in for Discord's Krisp) all run inside the daemon on PipeWire's realtime thread.
 - **See the delay.** Every node's title shows the delay it adds and how late the audio is there; where
   it ends up you see the total. If the same sound reaches a point over two paths with different delays
   (an echo), that's marked in amber.
@@ -78,7 +78,7 @@ and possibly far louder than your graph would make them.
 | **Equalizer** | Up to 32 bands (bell, shelves, low and high pass, notch) with a live response curve. |
 | **Levels** | Input and output meters, a noise gate (bottom limit) and a limiter (top limit). |
 | **Volume** | A 0–200% slider, or type any value up to 1000%. |
-| **Noise suppression** | Removes background noise (keyboards, fans, other voices) from a microphone. **RNNoise 0.2** adds 20 ms of delay and keeps voices natural; **DeepFilterNet 3** adds 40 ms and can sound muffled with headset mics that record at 16 kHz. *Reduction* sets how far noise is turned down: lower sounds more natural. **On** switches it off without a click (the delay stays). Works at 48 kHz (PipeWire's default); at other rates audio passes unchanged. |
+| **Noise suppression** | Removes background noise (keyboards, fans, other voices) from a microphone. Pick the model from the list: **RNNoise 0.2** adds 20 ms of delay and keeps voices natural; **DeepFilterNet 3** adds 40 ms and can sound muffled with headset mics that record at 16 kHz; **DPDFNet 2** is the strongest on mixed noise but adds about 80 ms and uses a fifth of a CPU core (it takes 1.5 s to load; until then audio passes unprocessed). *Reduction* sets how far noise is turned down: lower sounds more natural. **On** switches it off without a click (the delay stays). Works at 48 kHz (PipeWire's default); at other rates audio passes unchanged. |
 | **Output switch / Input switch** | Numbered pins; exactly one is live. Click it, press its key, or run `better-sound-patching select`. |
 
 ### Editing
@@ -206,5 +206,8 @@ Everything lives in `~/.config/better-sound-patching/` as plain TOML, safe to ba
 - **Noise suppression on the CPU.** [deep-filter-rt](https://gitlab.com/chpio/voice-filter) runs
   [DeepFilterNet 3](https://github.com/Rikorose/DeepFilterNet) with its model built in (MIT or
   Apache-2.0); [RNNoise](https://gitlab.xiph.org/xiph/rnnoise) 0.2 (BSD-3-Clause) is the system
-  library, whose models were retrained in 2024. Both run well under 1 ms per frame, so there's
-  nothing for a GPU to win.
+  library, whose models were retrained in 2024. Both run well under 1 ms per frame.
+  [DPDFNet 2](https://github.com/ceva-ip/DPDFNet) by Ceva (Apache-2.0, the model is in `models/`)
+  runs with [tract](https://github.com/sonos/tract) too, but at about 2 ms per 10 ms frame it's too
+  heavy for PipeWire's realtime thread, so it gets its own thread, fed through wait-free queues.
+  Its streaming STFT follows [HushMic](https://github.com/Fovty/HushMic).

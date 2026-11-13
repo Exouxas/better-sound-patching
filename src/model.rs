@@ -171,14 +171,18 @@ pub enum DenoiseModel {
     /// RNNoise 0.2 (the system's librnnoise): light, 20 ms of delay, keeps the voice natural.
     #[default]
     RnNoise,
+    /// DPDFNet-2 (Ceva): strongest on mixed noise, but about 80 ms of delay and a fifth of a CPU
+    /// core, on its own thread.
+    DpdfNet,
 }
 
 impl DenoiseModel {
-    pub const ALL: [DenoiseModel; 2] = [DenoiseModel::RnNoise, DenoiseModel::DeepFilterNet];
+    pub const ALL: [DenoiseModel; 3] = [DenoiseModel::RnNoise, DenoiseModel::DeepFilterNet, DenoiseModel::DpdfNet];
     pub fn label(self) -> &'static str {
         match self {
             DenoiseModel::DeepFilterNet => "DeepFilterNet 3",
-            DenoiseModel::RnNoise => "RNNoise",
+            DenoiseModel::RnNoise => "RNNoise 0.2",
+            DenoiseModel::DpdfNet => "DPDFNet 2",
         }
     }
     /// Delay from input to output, in milliseconds (model plus 10 ms frames).
@@ -186,6 +190,8 @@ impl DenoiseModel {
         match self {
             DenoiseModel::DeepFilterNet => 40,
             DenoiseModel::RnNoise => 20,
+            // With PipeWire buffers up to 480 samples; larger ones add more.
+            DenoiseModel::DpdfNet => 80,
         }
     }
 }

@@ -1,5 +1,5 @@
-//! Noise suppression with a neural network: DeepFilterNet 3 (`deep-filter-rt`, MIT or Apache-2.0,
-//! model embedded) or RNNoise 0.2 (Xiph's `librnnoise`, BSD-3-Clause, the system library with the
+//! Noise suppression with a neural network: DPDFNet-2 (see `dpdfnet.rs`), DeepFilterNet 3
+//! (`deep-filter-rt`, MIT or Apache-2.0, model embedded) or RNNoise 0.2 (Xiph's `librnnoise`, BSD-3-Clause, the system library with the
 //! models retrained in 2024). Both work on 10 ms frames of 48 kHz
 //! audio, so audio is gathered into frames first, which adds one frame of delay on top of the
 //! model's own.
@@ -8,6 +8,7 @@
 //! allocating; DeepFilterNet's inference library may allocate small buffers per frame, which
 //! costs far less than a frame lasts (about 0.15 ms per 10 ms on a desktop CPU).
 
+use crate::dpdfnet;
 use crate::dsp::MAX_CH;
 use crate::model::{DENOISE_FULL_DB, DenoiseModel};
 use deep_filter_rt::tract::{DfParams, DfTract, RuntimeParams};
@@ -68,16 +69,16 @@ pub const HOP: usize = 480;
 /// The only sample rate the models work at. At any other rate the audio passes unchanged.
 pub const RATE: f32 = 48000.0;
 
+/// The longest model delay: DPDFNet with the most slack.
+const MAX_DELAY: usize = dpdfnet::MODEL_DELAY + dpdfnet::MAX_LAG * HOP;
+
 /// RNNoise works on 16-bit sample values in floats.
 const I16: f32 = 32768.0;
 
 enum Engine {
-    RnNoise {
-        states: Vec<RnNoise>,
-        /// How much of the dry signal is mixed back to limit the reduction (0 = none).
-        mix: f32,
-    },
+    RnNoise(Vec<RnNoise>),
     DeepFilter { df: Box<DfTract>, noisy: Array2<f32>, enhanced: Array2<f32> },
+    DpdfNet(Box<dpdfnet::Worker>),
 }
 
 pub struct Denoiser {
@@ -87,12 +88,16 @@ pub struct Denoiser {
     pos: usize,
     input: [[f32; HOP]; MAX_CH],
     output: [[f32; HOP]; MAX_CH],
-    /// The model's own delay in samples (a multiple of [`HOP`]).
+    /// The model's own delay in samples (a multiple of [`HOP`]). Only DPDFNet's changes, when
+    /// PipeWire's buffers grow.
     delay: usize,
-    /// Recent input per channel, `delay + HOP` long, for the dry signal lined up with the model's
-    /// output. `dry_at` is where the current frame starts.
+    /// Recent input per channel, longer than the longest delay, for the dry signal lined up with
+    /// the model's output. `dry_at` is where the current frame starts.
     dry: Vec<Vec<f32>>,
     dry_at: usize,
+    /// How much of the dry signal is mixed back to limit the reduction (0 = none), where the model
+    /// doesn't do that itself.
+    mix: f32,
     /// Switched off: how much of the dry signal plays (1 = only dry), easing towards the target
     /// over one frame so switching doesn't click. The model keeps running, so it's ready when
     /// switched back on, and the delay stays the same either way.
@@ -105,7 +110,12 @@ impl Denoiser {
         let ch = channels.clamp(1, MAX_CH);
         let (engine, delay) = match model {
             // RNNoise's output is one frame behind its input.
-            DenoiseModel::RnNoise => (Engine::RnNoise { states: (0..ch).map(|_| RnNoise::new()).collect::<anyhow::Result<_>>()?, mix: 0.0 }, HOP),
+            DenoiseModel::RnNoise => (Engine::RnNoise((0..ch).map(|_| RnNoise::new()).collect::<anyhow::Result<_>>()?), HOP),
+            DenoiseModel::DpdfNet => {
+                let w = dpdfnet::Worker::start(ch)?;
+                let delay = dpdfnet::MODEL_DELAY + w.lag() * HOP;
+                (Engine::DpdfNet(Box::new(w)), delay)
+            }
             DenoiseModel::DeepFilterNet => {
                 let df = DfTract::new(DfParams::default(), &RuntimeParams::default_with_ch(ch))?;
                 anyhow::ensure!(df.hop_size == HOP && df.sr as f32 == RATE, "unexpected DeepFilterNet frame size or rate");
@@ -122,8 +132,9 @@ impl Denoiser {
             input: [[0.0; HOP]; MAX_CH],
             output: [[0.0; HOP]; MAX_CH],
             delay,
-            dry: vec![vec![0.0; delay + HOP]; ch],
+            dry: vec![vec![0.0; MAX_DELAY + HOP]; ch],
             dry_at: 0,
+            mix: 0.0,
             bypass: off,
             bypass_target: off,
         };
@@ -135,8 +146,8 @@ impl Denoiser {
     pub fn set_reduction(&mut self, db: f32) {
         let db = db.max(0.0);
         match &mut self.engine {
-            Engine::RnNoise { mix, .. } => *mix = if db >= DENOISE_FULL_DB { 0.0 } else { 10f32.powf(-db / 20.0) },
             Engine::DeepFilter { df, .. } => df.set_atten_lim(db.min(DENOISE_FULL_DB)),
+            _ => self.mix = if db >= DENOISE_FULL_DB { 0.0 } else { 10f32.powf(-db / 20.0) },
         }
     }
 
@@ -150,6 +161,10 @@ impl Denoiser {
     pub fn process(&mut self, ins: &[&[f32]], outs: &mut [&mut [f32]]) {
         let ch = self.ch.min(ins.len()).min(outs.len());
         let n = (0..ch).map(|c| ins[c].len().min(outs[c].len())).min().unwrap_or(0);
+        if let Engine::DpdfNet(w) = &mut self.engine {
+            w.fit_quantum(n);
+            self.delay = dpdfnet::MODEL_DELAY + w.lag() * HOP;
+        }
         for i in 0..n {
             for c in 0..ch {
                 outs[c][i] = self.output[c][self.pos];
@@ -165,15 +180,16 @@ impl Denoiser {
 
     fn run_frame(&mut self) {
         let ch = self.ch;
-        let len = self.delay + HOP;
+        let len = MAX_DELAY + HOP;
         for c in 0..ch {
             self.dry[c][self.dry_at..self.dry_at + HOP].copy_from_slice(&self.input[c]);
         }
         // The dry sample lined up with output sample `j`.
         let start = (self.dry_at + len - self.delay) % len;
         let dry = |c: usize, j: usize, d: &Vec<Vec<f32>>| d[c][(start + j) % len];
+        let mix = &self.mix;
         match &mut self.engine {
-            Engine::RnNoise { states, mix } => {
+            Engine::RnNoise(states) => {
                 let (mut x, mut y) = ([0f32; HOP], [0f32; HOP]);
                 for c in 0..ch {
                     for (x, v) in x.iter_mut().zip(&self.input[c]) {
@@ -182,6 +198,16 @@ impl Denoiser {
                     states[c].process(&mut y, &x);
                     for j in 0..HOP {
                         self.output[c][j] = y[j] / I16 * (1.0 - *mix) + dry(c, j, &self.dry) * *mix;
+                    }
+                }
+            }
+            Engine::DpdfNet(worker) => {
+                let mut wet = [[0f32; HOP]; MAX_CH];
+                let ok = worker.exchange(&self.input, &mut wet);
+                for c in 0..ch {
+                    for j in 0..HOP {
+                        let d = dry(c, j, &self.dry);
+                        self.output[c][j] = if ok { wet[c][j] * (1.0 - *mix) + d * *mix } else { d };
                     }
                 }
             }
@@ -252,6 +278,7 @@ mod tests {
         HOP + match model {
             DenoiseModel::RnNoise => HOP,
             DenoiseModel::DeepFilterNet => 1440,
+            DenoiseModel::DpdfNet => dpdfnet::MODEL_DELAY + dpdfnet::MIN_LAG * HOP,
         }
     }
 
@@ -295,6 +322,8 @@ mod tests {
     #[test]
     fn both_models_remove_hiss() {
         // RNNoise 0.2 takes it down 50 dB or more; the 2018 model managed about 10.
+        // DPDFNet runs on its own thread at real-time pace; its model has its own test, and the
+        // thread `dpdfnet_keeps_up_in_real_time`.
         for (model, at_least_db) in [(DenoiseModel::DeepFilterNet, 20.0), (DenoiseModel::RnNoise, 40.0)] {
             let mut d = Denoiser::new(model, 1, DENOISE_FULL_DB, true).unwrap();
             let noise = hiss(48000 * 6, 0.02);
@@ -302,6 +331,27 @@ mod tests {
             let db = 20.0 * (rms(&out[48000 * 5..]) / rms(&noise[48000 * 5..])).log10();
             assert!(db < -at_least_db, "{model:?}: hiss only {db:.1} dB down");
         }
+    }
+
+    /// Fed at the pace PipeWire would, after loading DPDFNet's thread keeps up and removes hiss.
+    /// Release builds only: debug builds run the model far slower than real time.
+    #[test]
+    #[cfg_attr(debug_assertions, ignore)]
+    fn dpdfnet_keeps_up_in_real_time() {
+        let mut d = Denoiser::new(DenoiseModel::DpdfNet, 1, DENOISE_FULL_DB, true).unwrap();
+        let block = 256;
+        let noise = hiss(block * 2000, 0.02);
+        let mut out = vec![0f32; noise.len()];
+        let start = std::time::Instant::now();
+        for (k, (i, o)) in noise.chunks(block).zip(out.chunks_mut(block)).enumerate() {
+            let due = start + std::time::Duration::from_secs_f64(k as f64 * block as f64 / RATE as f64);
+            std::thread::sleep(due.saturating_duration_since(std::time::Instant::now()));
+            d.process(&[i], &mut [o]);
+        }
+        // The last 3 s: model loaded (about 1.5 s) and warmed up.
+        let tail = noise.len() - 48000 * 3;
+        let db = 20.0 * (rms(&out[tail..]) / rms(&noise[tail..])).log10();
+        assert!(db < -20.0, "hiss only {db:.1} dB down");
     }
 
     #[test]

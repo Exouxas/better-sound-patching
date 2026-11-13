@@ -1,4 +1,5 @@
 mod denoise;
+mod dpdfnet;
 mod dsp;
 mod engine;
 mod filter;

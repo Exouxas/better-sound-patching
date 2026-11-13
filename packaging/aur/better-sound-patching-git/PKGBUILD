@@ -7,7 +7,7 @@ pkgrel=1
 pkgdesc='Node-based PipeWire patchbay and mixer'
 arch=('x86_64')
 url='https://github.com/Exouxas/better-sound-patching'
-license=('MIT')
+license=('MIT' 'Apache-2.0')
 depends=(
   'gcc-libs'
   'glibc'
@@ -71,6 +71,6 @@ package() {
   install -Dm0644 -t "$pkgdir/usr/lib/systemd/user/" "assets/$_pkgname.service"
   install -Dm0644 -t "$pkgdir/usr/share/applications/" "assets/$_pkgname.desktop"
   install -Dm0644 assets/icon.svg "$pkgdir/usr/share/icons/hicolor/scalable/apps/$_pkgname.svg"
-  install -Dm0644 -t "$pkgdir/usr/share/licenses/$pkgname/" LICENSE
+  install -Dm0644 -t "$pkgdir/usr/share/licenses/$pkgname/" LICENSE models/LICENSE-DPDFNet
   install -Dm0644 -t "$pkgdir/usr/share/doc/$pkgname/" README.md
 }

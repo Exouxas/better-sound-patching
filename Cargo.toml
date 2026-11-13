@@ -24,6 +24,9 @@ zbus = "5.19"
 ksni = { version = "0.3.7", default-features = false, features = ["blocking", "async-io"] }
 deep-filter-rt = "0.2.0"
 ndarray = "0.17"
+rtrb = "0.4.1"
+rustfft = "6.4.1"
+tract-onnx = "0.23.10"
 
 # A copy of egui-snarl 0.12.0 with left-click selection (see vendor/egui-snarl/BSP-CHANGES.md).
 [patch.crates-io]

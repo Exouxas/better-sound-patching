@@ -1002,15 +1002,20 @@ fn denoise_editor(ui: &mut Ui, d: &mut DenoiseSpec, reading: Option<Reading>) {
         }
     });
     ui.horizontal(|ui| {
-        for m in DenoiseModel::ALL {
-            let hint = match m {
-                DenoiseModel::DeepFilterNet => "DeepFilterNet 3. 40 ms of delay. Can sound muffled with headset mics that record at 16 kHz.",
-                DenoiseModel::RnNoise => "RNNoise 0.2. 20 ms of delay, light, keeps the voice natural.",
-            };
-            if ui.selectable_label(d.model == m, m.label()).on_hover_text(hint).clicked() {
-                d.model = m;
-            }
-        }
+        ui.label("Model");
+        egui::ComboBox::from_id_salt(("denoise-model", d.name.as_str()))
+            .selected_text(format!("{} · {} ms", d.model.label(), d.model.delay_ms()))
+            .width(170.0)
+            .show_ui(ui, |ui| {
+                for m in DenoiseModel::ALL {
+                    let hint = match m {
+                        DenoiseModel::RnNoise => "Light, keeps the voice natural.",
+                        DenoiseModel::DeepFilterNet => "Can sound muffled with headset mics that record at 16 kHz.",
+                        DenoiseModel::DpdfNet => "Strongest on mixed noise. Takes about 1.5 s to load; until then audio passes unprocessed.",
+                    };
+                    ui.selectable_value(&mut d.model, m, format!("{} · {} ms", m.label(), m.delay_ms())).on_hover_text(hint);
+                }
+            });
     });
     ui.horizontal(|ui| {
         ui.label("Reduction");
