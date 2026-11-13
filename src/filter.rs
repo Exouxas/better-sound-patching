@@ -1,10 +1,11 @@
-//! Processing nodes (EQ, levels, volume) as PipeWire filter nodes, running inside this process.
+//! Processing nodes (EQ, levels, volume, noise suppression) as PipeWire filter nodes, running inside this process.
 //!
 //! pipewire-rs doesn't wrap `pw_filter`, so this is a small unsafe layer over the C API.
 //! Audio is processed on PipeWire's realtime thread. Settings reach it lock-free in practice:
 //! the main thread bumps a generation counter, and the realtime thread only `try_lock`s
 //! (never blocks) to copy the new settings when the counter changed.
 
+use crate::denoise::Denoiser;
 use crate::dsp::{MAX_CH, Meter, Params, Processor, Reading};
 use crate::model::{Channels, FilterSpec};
 use anyhow::{Result, bail};
@@ -127,14 +128,19 @@ impl FilterNode {
             FilterSpec::Eq(_) => "EQ",
             FilterSpec::Levels(_) => "Levels",
             FilterSpec::Volume(_) => "Volume",
+            FilterSpec::Denoise(_) => "Noise suppression",
         };
         let description = format!("{what} {}", spec.name());
         let params = Params::from_spec(spec);
         let shared = Arc::new(Shared { generation: AtomicU64::new(1), params: Mutex::new(params), meter: Meter::new() });
+        let mut proc = Processor::new(params);
+        if let FilterSpec::Denoise(d) = spec {
+            proc = proc.with_denoiser(Denoiser::new(d.model, channels.len(), d.reduction_db)?);
+        }
         let rt = Box::new(Rt {
             ins: vec![],
             outs: vec![],
-            proc: Processor::new(params),
+            proc,
             shared: shared.clone(),
             generation: 0,
             rate: 0,

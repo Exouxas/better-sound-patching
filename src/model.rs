@@ -2,6 +2,7 @@
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 /// A reference to a PipeWire node by its stable `node.name`.
@@ -161,12 +162,72 @@ pub struct VolumeSpec {
 /// Highest volume you can type in (1000%).
 pub const MAX_VOLUME: f32 = 10.0;
 
+/// Which neural network removes the noise. Both run on the CPU inside the daemon.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum DenoiseModel {
+    /// DeepFilterNet 3: the better one, also with keyboards and voices in the background.
+    /// About 40 ms of delay.
+    #[default]
+    DeepFilterNet,
+    /// RNNoise: lighter and quicker (about 20 ms of delay), but lets more noise through.
+    RnNoise,
+}
+
+impl DenoiseModel {
+    pub const ALL: [DenoiseModel; 2] = [DenoiseModel::DeepFilterNet, DenoiseModel::RnNoise];
+    pub fn label(self) -> &'static str {
+        match self {
+            DenoiseModel::DeepFilterNet => "DeepFilterNet 3",
+            DenoiseModel::RnNoise => "RNNoise",
+        }
+    }
+    /// Delay from input to output, in milliseconds (model plus 10 ms frames).
+    pub fn delay_ms(self) -> u32 {
+        match self {
+            DenoiseModel::DeepFilterNet => 40,
+            DenoiseModel::RnNoise => 20,
+        }
+    }
+}
+
+/// At or above this reduction the noise isn't limited at all: it's removed as far as the model can.
+pub const DENOISE_FULL_DB: f32 = 100.0;
+
+fn mono() -> Channels {
+    Channels::Mono
+}
+
+fn full_reduction() -> f32 {
+    DENOISE_FULL_DB
+}
+
+/// Noise suppression: removes background noise from speech.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DenoiseSpec {
+    pub name: String,
+    #[serde(default = "mono")]
+    pub channels: Channels,
+    #[serde(default)]
+    pub model: DenoiseModel,
+    /// The most the noise is turned down, in dB. Lower values sound more natural but leave
+    /// some noise; [`DENOISE_FULL_DB`] and above don't limit it.
+    #[serde(default = "full_reduction")]
+    pub reduction_db: f32,
+}
+
+impl DenoiseSpec {
+    pub fn new(name: &str) -> Self {
+        DenoiseSpec { name: name.into(), channels: Channels::Mono, model: DenoiseModel::default(), reduction_db: DENOISE_FULL_DB }
+    }
+}
+
 /// One audio-processing node that runs inside the daemon.
 #[derive(Debug, Clone, PartialEq)]
 pub enum FilterSpec {
     Eq(EqSpec),
     Levels(LevelsSpec),
     Volume(VolumeSpec),
+    Denoise(DenoiseSpec),
 }
 
 impl FilterSpec {
@@ -175,6 +236,7 @@ impl FilterSpec {
             FilterSpec::Eq(e) => &e.name,
             FilterSpec::Levels(l) => &l.name,
             FilterSpec::Volume(v) => &v.name,
+            FilterSpec::Denoise(d) => &d.name,
         }
     }
     pub fn channels(&self) -> Channels {
@@ -182,6 +244,7 @@ impl FilterSpec {
             FilterSpec::Eq(e) => e.channels,
             FilterSpec::Levels(l) => l.channels,
             FilterSpec::Volume(v) => v.channels,
+            FilterSpec::Denoise(d) => d.channels,
         }
     }
     /// Same kind and layout: can be retuned in place instead of rebuilt.
@@ -189,6 +252,14 @@ impl FilterSpec {
         std::mem::discriminant(self) == std::mem::discriminant(other)
             && self.name() == other.name()
             && self.channels() == other.channels()
+            && self.denoise_model() == other.denoise_model()
+    }
+    /// A different model needs a new node: its state can't carry over.
+    fn denoise_model(&self) -> Option<DenoiseModel> {
+        match self {
+            FilterSpec::Denoise(d) => Some(d.model),
+            _ => None,
+        }
     }
 }
 
@@ -231,6 +302,8 @@ pub enum NodeKind {
     Levels(LevelsSpec),
     /// Passes audio through at a volume you set.
     Volume(VolumeSpec),
+    /// Removes background noise from speech.
+    Denoise(DenoiseSpec),
 }
 
 /// A program, matched by its executable name (stable across restarts).
@@ -248,7 +321,7 @@ impl NodeKind {
         match self {
             NodeKind::Output { .. } | NodeKind::Bus(_) | NodeKind::Eq(_) | NodeKind::App { .. } => 1,
             NodeKind::OtherAppsRecording | NodeKind::SwitchOutput { .. } => 1,
-            NodeKind::Levels(_) | NodeKind::Volume(_) => 1,
+            NodeKind::Levels(_) | NodeKind::Volume(_) | NodeKind::Denoise(_) => 1,
             NodeKind::SwitchInput { pins, .. } => pins.len(),
             NodeKind::Input { .. } | NodeKind::OtherAppsPlayback => 0,
         }
@@ -257,7 +330,7 @@ impl NodeKind {
         match self {
             NodeKind::Input { .. } | NodeKind::Bus(_) | NodeKind::Eq(_) | NodeKind::App { .. } => 1,
             NodeKind::OtherAppsPlayback | NodeKind::SwitchInput { .. } => 1,
-            NodeKind::Levels(_) | NodeKind::Volume(_) => 1,
+            NodeKind::Levels(_) | NodeKind::Volume(_) | NodeKind::Denoise(_) => 1,
             NodeKind::SwitchOutput { pins, .. } => pins.len(),
             NodeKind::Output { .. } | NodeKind::OtherAppsRecording => 0,
         }
@@ -278,6 +351,7 @@ impl NodeKind {
             NodeKind::Eq(e) => Some(FilterSpec::Eq(e.clone())),
             NodeKind::Levels(l) => Some(FilterSpec::Levels(l.clone())),
             NodeKind::Volume(v) => Some(FilterSpec::Volume(v.clone())),
+            NodeKind::Denoise(d) => Some(FilterSpec::Denoise(d.clone())),
             _ => None,
         }
     }
@@ -288,6 +362,7 @@ impl NodeKind {
             NodeKind::Eq(e) => Some(&mut e.name),
             NodeKind::Levels(l) => Some(&mut l.name),
             NodeKind::Volume(v) => Some(&mut v.name),
+            NodeKind::Denoise(d) => Some(&mut d.name),
             NodeKind::SwitchOutput { name, .. } | NodeKind::SwitchInput { name, .. } => Some(name),
             _ => None,
         }
@@ -299,6 +374,7 @@ impl NodeKind {
             NodeKind::Eq(e) => Some(&e.name),
             NodeKind::Levels(l) => Some(&l.name),
             NodeKind::Volume(v) => Some(&v.name),
+            NodeKind::Denoise(d) => Some(&d.name),
             _ => None,
         }
     }
@@ -332,6 +408,132 @@ impl Wire {
     pub fn new(from: u32, to: u32) -> Wire {
         Wire { from, to, from_pin: 0, to_pin: 0 }
     }
+}
+
+/// How long audio takes to get somewhere, in ms, over every path it takes there.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Delay {
+    pub min: u32,
+    pub max: u32,
+    /// The same sound arrives more than once, at different delays: an echo, or a hollow,
+    /// phasey sound when the delays are short.
+    pub doubled: bool,
+}
+
+/// The delay of each node: what it adds itself, and how late audio arrives at its input and
+/// leaves its output, counted from where it entered the graph (a device, a program or a
+/// virtual output programs play into). `None` where no audio gets to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct NodeDelay {
+    pub own: u32,
+    pub arriving: Option<Delay>,
+    pub leaving: Option<Delay>,
+}
+
+impl NodeKind {
+    /// Delay this node adds itself, in ms. PipeWire's own buffering isn't counted.
+    pub fn delay_ms(&self) -> u32 {
+        match self {
+            NodeKind::Denoise(d) => d.model.delay_ms(),
+            _ => 0,
+        }
+    }
+}
+
+/// Earliest and latest arrival of each source (by node id) at one point.
+type Arrivals = BTreeMap<u32, (u32, u32)>;
+
+fn merge(into: &mut Arrivals, from: &Arrivals, add: u32) {
+    for (&src, &(lo, hi)) in from {
+        let e = into.entry(src).or_insert((u32::MAX, 0));
+        e.0 = e.0.min(lo + add);
+        e.1 = e.1.max(hi + add);
+    }
+}
+
+fn summary(a: &Arrivals) -> Option<Delay> {
+    (!a.is_empty()).then(|| Delay {
+        min: a.values().map(|v| v.0).min().unwrap(),
+        max: a.values().map(|v| v.1).max().unwrap(),
+        doubled: a.values().any(|v| v.0 != v.1),
+    })
+}
+
+/// The delay at every node of `graph`, following only the pin each switch is using
+/// (`active`: switch node id -> pin). Loops are cut where they close.
+pub fn delays(graph: &Graph, active: &BTreeMap<u32, Option<u32>>) -> BTreeMap<u32, NodeDelay> {
+    struct Walk<'a> {
+        kinds: BTreeMap<u32, &'a NodeKind>,
+        wires: &'a [Wire],
+        active: &'a BTreeMap<u32, Option<u32>>,
+        leaving: BTreeMap<u32, Arrivals>,
+        busy: std::collections::BTreeSet<u32>,
+    }
+    impl Walk<'_> {
+        fn passes(&self, w: &Wire) -> bool {
+            let on = |id: u32, pin: u32| self.active.get(&id).copied().flatten() == Some(pin);
+            let from_ok = !matches!(self.kinds.get(&w.from), Some(NodeKind::SwitchOutput { .. })) || on(w.from, w.from_pin);
+            let to_ok = !matches!(self.kinds.get(&w.to), Some(NodeKind::SwitchInput { .. })) || on(w.to, w.to_pin);
+            from_ok && to_ok
+        }
+        fn arriving(&mut self, id: u32) -> Arrivals {
+            let mut a = Arrivals::new();
+            for w in self.wires.iter().filter(|w| w.to == id) {
+                if self.passes(w) {
+                    let from = self.leave(w.from);
+                    merge(&mut a, &from, 0);
+                }
+            }
+            a
+        }
+        fn leave(&mut self, id: u32) -> Arrivals {
+            if let Some(a) = self.leaving.get(&id) {
+                return a.clone();
+            }
+            let Some(kind) = self.kinds.get(&id).copied() else { return Arrivals::new() };
+            // A loop: what comes round again is already counted where it started.
+            if !self.busy.insert(id) {
+                return Arrivals::new();
+            }
+            let a = match kind {
+                // What a program plays has nothing to do with what it records.
+                NodeKind::App { .. } | NodeKind::Input { .. } | NodeKind::OtherAppsPlayback => Arrivals::from([(id, (0, 0))]),
+                NodeKind::Output { .. } | NodeKind::OtherAppsRecording => Arrivals::new(),
+                NodeKind::Bus(b) => {
+                    let mut a = self.arriving(id);
+                    if b.kind == BusKind::Playback {
+                        // Programs play into it directly.
+                        a.insert(id, (0, 0));
+                    }
+                    a
+                }
+                k => {
+                    let mut a = Arrivals::new();
+                    merge(&mut a, &self.arriving(id), k.delay_ms());
+                    a
+                }
+            };
+            self.busy.remove(&id);
+            self.leaving.insert(id, a.clone());
+            a
+        }
+    }
+    let mut walk = Walk {
+        kinds: graph.nodes.iter().map(|n| (n.id, &n.kind)).collect(),
+        wires: &graph.wires,
+        active,
+        leaving: BTreeMap::new(),
+        busy: Default::default(),
+    };
+    graph
+        .nodes
+        .iter()
+        .map(|n| {
+            let leaving = summary(&walk.leave(n.id));
+            let arriving = summary(&walk.arriving(n.id));
+            (n.id, NodeDelay { own: n.kind.delay_ms(), arriving, leaving })
+        })
+        .collect()
 }
 
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
@@ -483,6 +685,79 @@ pub fn write_atomic(path: &std::path::Path, contents: &str) -> Result<()> {
 mod tests {
     use super::*;
 
+    fn node(id: u32, kind: NodeKind) -> GraphNode {
+        GraphNode { id, pos: [0.0, 0.0], kind }
+    }
+
+    fn denoise(name: &str, model: DenoiseModel) -> NodeKind {
+        NodeKind::Denoise(DenoiseSpec { model, ..DenoiseSpec::new(name) })
+    }
+
+    #[test]
+    fn delays_add_up_along_a_chain() {
+        // mic -> DeepFilterNet -> RNNoise -> virtual mic
+        let g = Graph {
+            nodes: vec![
+                node(1, NodeKind::Input { device: None }),
+                node(2, denoise("a", DenoiseModel::DeepFilterNet)),
+                node(3, denoise("b", DenoiseModel::RnNoise)),
+                node(4, NodeKind::Bus(BusSpec::new("mic", BusKind::Microphone, Channels::Mono))),
+            ],
+            wires: vec![Wire::new(1, 2), Wire::new(2, 3), Wire::new(3, 4)],
+        };
+        let d = delays(&g, &BTreeMap::new());
+        assert_eq!(d[&2].own, 40);
+        assert_eq!(d[&3].arriving, Some(Delay { min: 40, max: 40, doubled: false }));
+        assert_eq!(d[&4].leaving, Some(Delay { min: 60, max: 60, doubled: false }));
+    }
+
+    #[test]
+    fn one_sound_over_two_paths_is_doubled_but_two_sounds_are_not() {
+        // mic -> denoise -> out, and mic -> out directly: the same sound twice.
+        let mut g = Graph {
+            nodes: vec![
+                node(1, NodeKind::Input { device: None }),
+                node(2, denoise("a", DenoiseModel::RnNoise)),
+                node(3, NodeKind::Output { device: None }),
+                node(4, NodeKind::Input { device: None }),
+            ],
+            wires: vec![Wire::new(1, 2), Wire::new(2, 3), Wire::new(1, 3)],
+        };
+        assert_eq!(delays(&g, &BTreeMap::new())[&3].arriving, Some(Delay { min: 0, max: 20, doubled: true }));
+        // Another mic, undelayed, alongside the denoised one: different sounds, no echo.
+        g.wires = vec![Wire::new(1, 2), Wire::new(2, 3), Wire::new(4, 3)];
+        assert_eq!(delays(&g, &BTreeMap::new())[&3].arriving, Some(Delay { min: 0, max: 20, doubled: false }));
+    }
+
+    #[test]
+    fn delays_follow_the_switch_and_survive_loops() {
+        // mic -> switch pin 0 -> denoise -> out; switch pin 1 -> out. And a loop out of reach.
+        let g = Graph {
+            nodes: vec![
+                node(1, NodeKind::Input { device: None }),
+                node(2, NodeKind::SwitchOutput { name: "s".into(), pins: vec![SwitchPin::default(); 2] }),
+                node(3, denoise("a", DenoiseModel::DeepFilterNet)),
+                node(4, NodeKind::Output { device: None }),
+                node(5, NodeKind::Volume(VolumeSpec { name: "v1".into(), channels: Channels::Mono, gain: 1.0 })),
+                node(6, NodeKind::Volume(VolumeSpec { name: "v2".into(), channels: Channels::Mono, gain: 1.0 })),
+            ],
+            wires: vec![
+                Wire::new(1, 2),
+                Wire { from: 2, to: 3, from_pin: 0, to_pin: 0 },
+                Wire::new(3, 4),
+                Wire { from: 2, to: 4, from_pin: 1, to_pin: 0 },
+                Wire::new(5, 6),
+                Wire::new(6, 5),
+            ],
+        };
+        let at_out = |pin| delays(&g, &BTreeMap::from([(2, Some(pin))]))[&4].arriving;
+        assert_eq!(at_out(0), Some(Delay { min: 40, max: 40, doubled: false }));
+        assert_eq!(at_out(1), Some(Delay { min: 0, max: 0, doubled: false }));
+        let d = delays(&g, &BTreeMap::new());
+        assert_eq!(d[&4].arriving, None);
+        assert_eq!(d[&5].leaving, None);
+    }
+
     #[test]
     fn graph_roundtrips_through_toml() {
         let p = Graph {
@@ -519,6 +794,11 @@ mod tests {
                     id: 8,
                     pos: [0.0, 0.0],
                     kind: NodeKind::Volume(VolumeSpec { name: "volume-1".into(), channels: Channels::Mono, gain: 0.5 }),
+                },
+                GraphNode {
+                    id: 9,
+                    pos: [0.0, 0.0],
+                    kind: NodeKind::Denoise(DenoiseSpec { model: DenoiseModel::RnNoise, reduction_db: 24.0, ..DenoiseSpec::new("denoise-1") }),
                 },
                 GraphNode {
                     id: 6,

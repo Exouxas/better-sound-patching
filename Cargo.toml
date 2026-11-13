@@ -5,7 +5,7 @@ edition = "2024"
 description = "Node-based PipeWire patchbay and mixer"
 license = "MIT"
 repository = "https://github.com/Exouxas/better-sound-patching"
-rust-version = "1.95"
+rust-version = "1.96"
 
 [dependencies]
 anyhow = "1.0.104"
@@ -22,6 +22,9 @@ serde_json = "1.0.154"
 toml = "1.1.8"
 zbus = "5.19"
 ksni = { version = "0.3.7", default-features = false, features = ["blocking", "async-io"] }
+nnnoiseless = { version = "0.5.2", default-features = false }
+deep-filter-rt = "0.2.0"
+ndarray = "0.17"
 
 # A copy of egui-snarl 0.12.0 with left-click selection (see vendor/egui-snarl/BSP-CHANGES.md).
 [patch.crates-io]

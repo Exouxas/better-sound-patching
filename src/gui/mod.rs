@@ -1048,6 +1048,7 @@ impl eframe::App for App {
             let shows_levels = profile.nodes.iter().any(|n| n.kind.filter().is_some());
             self.want_levels.store(shows_levels && info.status.is_some(), Ordering::Relaxed);
             let readings = self.readings.lock().unwrap().clone();
+            let delays = crate::model::delays(&profile, &plan.active_slots);
             self.edit_shortcuts(ui);
             let mut viewer = graph::Viewer {
                 live: &live,
@@ -1064,6 +1065,7 @@ impl eframe::App for App {
                 labels: &mut self.labels,
                 labels_changed: false,
                 changed: false,
+                delays: &delays,
             };
             SnarlWidget::new()
                 .id(graph_id())

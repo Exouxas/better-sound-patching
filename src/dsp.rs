@@ -2,6 +2,7 @@
 //! audio EQ cookbook), level meter with gate and limiter, and volume. No PipeWire here, so it's
 //! unit-testable. Everything that runs per sample is allocation-free.
 
+use crate::denoise::Denoiser;
 use crate::model::{Band, BandKind, FilterSpec, MAX_BANDS};
 use std::f64::consts::PI;
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -210,6 +211,7 @@ pub enum Params {
     Eq(EqParams),
     Levels { gate: Option<f32>, limit: Option<f32> },
     Volume { gain: f32 },
+    Denoise { reduction_db: f32 },
 }
 
 impl Params {
@@ -221,6 +223,7 @@ impl Params {
                 limit: l.limit_on.then(|| db_to_lin(l.limit_db)),
             },
             FilterSpec::Volume(v) => Params::Volume { gain: v.gain.clamp(0.0, crate::model::MAX_VOLUME) },
+            FilterSpec::Denoise(d) => Params::Denoise { reduction_db: d.reduction_db },
         }
     }
 }
@@ -237,6 +240,8 @@ pub struct Processor {
     limit_g: f32,
     /// Volume: smoothed gain.
     vol_g: f32,
+    /// Noise suppression: the model and its state, made before the node goes live.
+    denoiser: Option<Box<Denoiser>>,
 }
 
 pub const MAX_CH: usize = 2;
@@ -244,7 +249,13 @@ pub const MAX_CH: usize = 2;
 impl Processor {
     pub fn new(params: Params) -> Self {
         let vol_g = if let Params::Volume { gain } = params { gain } else { 1.0 };
-        Processor { params, rate: 0.0, chains: Default::default(), env: 0.0, gate_g: 1.0, hold: 0, limit_g: 1.0, vol_g }
+        Processor { params, rate: 0.0, chains: Default::default(), env: 0.0, gate_g: 1.0, hold: 0, limit_g: 1.0, vol_g, denoiser: None }
+    }
+
+    /// Give a noise-suppression node its model (it does nothing without one).
+    pub fn with_denoiser(mut self, d: Denoiser) -> Self {
+        self.denoiser = Some(Box::new(d));
+        self
     }
 
     pub fn set(&mut self, params: Params, rate: f32) {
@@ -254,6 +265,9 @@ impl Processor {
             for c in &mut self.chains {
                 c.set(p, rate as f64);
             }
+        }
+        if let (Params::Denoise { reduction_db }, Some(d)) = (params, &mut self.denoiser) {
+            d.set_reduction(reduction_db);
         }
     }
 
@@ -270,6 +284,15 @@ impl Processor {
                     self.chains[c].process(&ins[c][..n], &mut outs[c][..n]);
                 }
             }
+            Params::Denoise { .. } => match &mut self.denoiser {
+                // The models only know 48 kHz audio; anything else passes as it is.
+                Some(d) if self.rate == crate::denoise::RATE => d.process(&ins[..ch], &mut outs[..ch]),
+                _ => {
+                    for c in 0..ch {
+                        outs[c][..n].copy_from_slice(&ins[c][..n]);
+                    }
+                }
+            },
             Params::Volume { gain } => {
                 let k = coef(0.01, self.rate);
                 for i in 0..n {

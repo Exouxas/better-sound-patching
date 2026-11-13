@@ -3,7 +3,7 @@
 </p>
 
 <p align="center">
-  <img alt="Rust" src="https://img.shields.io/badge/Rust-1.95%2B-dea584?logo=rust&logoColor=white">
+  <img alt="Rust" src="https://img.shields.io/badge/Rust-1.96%2B-dea584?logo=rust&logoColor=white">
   <img alt="PipeWire" src="https://img.shields.io/badge/PipeWire-1.x-4a90d9">
   <img alt="Platform" src="https://img.shields.io/badge/platform-Linux-2ea043?logo=linux&logoColor=white">
   <img alt="GUI" src="https://img.shields.io/badge/GUI-native%20egui-8b949e">
@@ -30,7 +30,11 @@ It is written entirely in Rust with a native GUI. There is no Electron, no web v
   terminal, or with a **global keyboard shortcut**. Pins on different switches that share a key change
   together, so one key can move both output and mic to your VR headset.
 - **Built-in processing.** A parametric **EQ** with a draggable curve, a **Levels** node (meters, noise
-  gate, limiter) and a **Volume** node all run inside the daemon on PipeWire's realtime thread.
+  gate, limiter), a **Volume** node and **noise suppression** (DeepFilterNet 3 or RNNoise, a stand-in
+  for Discord's Krisp) all run inside the daemon on PipeWire's realtime thread.
+- **See the delay.** Every node's title shows the delay it adds and how late the audio is there; where
+  it ends up you see the total. If the same sound reaches a point over two paths with different delays
+  (an echo), that's marked in amber.
 - **Master volume and a tray icon.** One slider turns everything you hear up or down together, keeping
   the balance between programs. Scroll over the tray icon to change it; click the icon to open the editor.
 - **Your names, everywhere.** A virtual device's label is the name programs and your desktop's sound
@@ -74,6 +78,7 @@ and possibly far louder than your graph would make them.
 | **Equalizer** | Up to 32 bands (bell, shelves, low and high pass, notch) with a live response curve. |
 | **Levels** | Input and output meters, a noise gate (bottom limit) and a limiter (top limit). |
 | **Volume** | A 0–200% slider, or type any value up to 1000%. |
+| **Noise suppression** | Removes background noise (keyboards, fans, other voices) from a microphone. **DeepFilterNet 3** sounds best and adds 40 ms of delay; **RNNoise** adds 20 ms but lets more through. *Reduction* sets how far noise is turned down: lower sounds more natural. Works at 48 kHz (PipeWire's default); at other rates audio passes unchanged. |
 | **Output switch / Input switch** | Numbered pins; exactly one is live. Click it, press its key, or run `better-sound-patching select`. |
 
 ### Editing
@@ -131,7 +136,7 @@ After an update the running daemon keeps the old version until it restarts: log 
 ### Requirements
 
 - Linux with **PipeWire** 1.x and **WirePlumber** 0.5
-- To build it yourself: **Rust** 1.95 or newer and **clang**, which the PipeWire bindings need
+- To build it yourself: **Rust** 1.96 or newer and **clang**, which the PipeWire bindings need
 - Optional: a desktop with the XDG GlobalShortcuts portal for global keys, and a system tray
   (StatusNotifierItem) for the tray icon. KDE Plasma 6 has both.
 
@@ -195,4 +200,10 @@ Everything lives in `~/.config/better-sound-patching/` as plain TOML, safe to ba
 - **Pure planning.** The planner turns *graph + live PipeWire state* into the exact set of links that
   should exist. It makes no PipeWire calls, so it is fully unit-tested.
 - **Allocation-free DSP.** EQ biquads run in 64-bit floats; the limiter has an instant attack, so no
-  sample ever exceeds its ceiling.
+  sample ever exceeds its ceiling. The one exception is DeepFilterNet's inference library, which may
+  allocate small buffers per 10 ms frame; a frame takes about 0.15 ms on a desktop CPU.
+- **Noise suppression on the CPU.** [deep-filter-rt](https://gitlab.com/chpio/voice-filter) runs
+  [DeepFilterNet 3](https://github.com/Rikorose/DeepFilterNet) with its model built in (MIT or
+  Apache-2.0); [nnnoiseless](https://github.com/jneem/nnnoiseless) is a Rust port of
+  [RNNoise](https://github.com/xiph/rnnoise) (BSD-3-Clause). Both run well under 1 ms per frame, so
+  there's nothing for a GPU to win.

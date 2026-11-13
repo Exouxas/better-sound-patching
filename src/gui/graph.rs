@@ -3,7 +3,7 @@
 use crate::dsp::{self, Reading};
 use crate::live::{Live, LiveNode};
 use crate::model::{
-    AppRef, Band, BandKind, BusKind, BusSpec, Channels, DeviceRef, EqSpec, Graph, GraphNode, Labels, LevelsSpec, MAX_BANDS,
+    AppRef, Band, BandKind, BusKind, BusSpec, Channels, DENOISE_FULL_DB, DenoiseModel, DenoiseSpec, DeviceRef, EqSpec, Graph, GraphNode, NodeDelay, Labels, LevelsSpec, MAX_BANDS,
     MAX_VOLUME, NodeKind, SwitchPin, VolumeSpec, Wire,
 };
 use egui::{Color32, Pos2, Rect, RichText, Sense, Stroke, Ui, vec2};
@@ -80,6 +80,8 @@ pub struct Viewer<'a> {
     pub labels: &'a mut Labels,
     pub labels_changed: bool,
     pub changed: bool,
+    /// Processing delay at each node, by graph node id.
+    pub delays: &'a BTreeMap<u32, NodeDelay>,
 }
 
 /// The name to show for a device: your label, else its description.
@@ -470,6 +472,7 @@ fn approx_size(kind: &NodeKind) -> egui::Vec2 {
         NodeKind::Eq(_) => vec2(340.0, 340.0),
         NodeKind::Levels(_) => vec2(320.0, 160.0),
         NodeKind::Volume(_) => vec2(320.0, 110.0),
+        NodeKind::Denoise(_) => vec2(320.0, 170.0),
         NodeKind::SwitchOutput { pins, .. } | NodeKind::SwitchInput { pins, .. } => vec2(360.0, 110.0 + 26.0 * pins.len() as f32),
         _ => vec2(290.0, 120.0),
     }
@@ -524,6 +527,15 @@ impl SnarlViewer<NodeKind> for Viewer<'_> {
             NodeKind::SwitchInput { .. } => "Input switch".into(),
             NodeKind::Levels(_) => "Levels".into(),
             NodeKind::Volume(_) => "Volume".into(),
+            NodeKind::Denoise(_) => "Noise suppression".into(),
+        }
+    }
+
+    fn show_header(&mut self, node: NodeId, _i: &[InPin], _o: &[OutPin], ui: &mut Ui, snarl: &mut Snarl<NodeKind>) {
+        let kind = &snarl[node];
+        ui.label(self.title(kind));
+        if let Some(d) = self.delays.get(&(node.0 as u32)) {
+            delay_badge(ui, kind, d);
         }
     }
 
@@ -548,7 +560,7 @@ impl SnarlViewer<NodeKind> for Viewer<'_> {
                 ui.label("in");
                 Self::colored(GREEN)
             }
-            NodeKind::Levels(_) | NodeKind::Volume(_) => {
+            NodeKind::Levels(_) | NodeKind::Volume(_) | NodeKind::Denoise(_) => {
                 ui.label("in");
                 Self::colored(if self.running { GREEN } else { GREY })
             }
@@ -576,7 +588,7 @@ impl SnarlViewer<NodeKind> for Viewer<'_> {
                 ui.label("out");
                 Self::colored(GREEN)
             }
-            NodeKind::Levels(_) | NodeKind::Volume(_) => {
+            NodeKind::Levels(_) | NodeKind::Volume(_) | NodeKind::Denoise(_) => {
                 ui.label("out");
                 Self::colored(if self.running { GREEN } else { GREY })
             }
@@ -669,6 +681,13 @@ impl SnarlViewer<NodeKind> for Viewer<'_> {
                     self.changed |= *v != before;
                     self.not_running_note(ui);
                 }
+                NodeKind::Denoise(d) => {
+                    let reading = self.reading(&d.name);
+                    let before = d.clone();
+                    denoise_editor(ui, d, reading);
+                    self.changed |= *d != before;
+                    self.not_running_note(ui);
+                }
             }
         });
         if let Some(map) = moved_pins {
@@ -715,6 +734,9 @@ impl SnarlViewer<NodeKind> for Viewer<'_> {
         }
         if ui.button("Volume").clicked() {
             add = Some(NodeKind::Volume(VolumeSpec { name: unique_name(snarl, "volume"), channels: Channels::Stereo, gain: 1.0 }));
+        }
+        if ui.button("Noise suppression").on_hover_text("Removes background noise from a microphone").clicked() {
+            add = Some(NodeKind::Denoise(DenoiseSpec::new(&unique_name(snarl, "denoise"))));
         }
         ui.separator();
         if ui.button("Output switch").on_hover_text("Send audio to one of several outputs; you pick which").clicked() {
@@ -964,6 +986,97 @@ fn volume_editor(ui: &mut Ui, v: &mut VolumeSpec, reading: Option<Reading>) {
     meter_bar(ui.painter(), rect, reading.map(|r| r.out_peak));
     let db_text = if v.gain <= 0.0 { "muted".to_owned() } else { format!("{:+.1} dB", dsp::lin_to_db(v.gain)) };
     ui.label(RichText::new(format!("{db_text} · type a number for more than 200%")).small().weak());
+}
+
+/// Noise suppression: the model, how far it may turn the noise down, and in/out meters.
+fn denoise_editor(ui: &mut Ui, d: &mut DenoiseSpec, reading: Option<Reading>) {
+    ui.horizontal(|ui| {
+        for (c, label) in [(Channels::Mono, "Mono"), (Channels::Stereo, "Stereo")] {
+            if ui.selectable_label(d.channels == c, label).clicked() {
+                d.channels = c;
+            }
+        }
+    });
+    ui.horizontal(|ui| {
+        for m in DenoiseModel::ALL {
+            let hint = match m {
+                DenoiseModel::DeepFilterNet => "Best quality, also with keyboards and other voices. About 40 ms of delay.",
+                DenoiseModel::RnNoise => "Lighter and quicker (about 20 ms of delay), but lets more noise through.",
+            };
+            if ui.selectable_label(d.model == m, m.label()).on_hover_text(hint).clicked() {
+                d.model = m;
+            }
+        }
+    });
+    ui.horizontal(|ui| {
+        ui.label("Reduction");
+        ui.spacing_mut().slider_width = 150.0;
+        ui.add(
+            egui::Slider::new(&mut d.reduction_db, 3.0..=DENOISE_FULL_DB)
+                .logarithmic(true)
+                .step_by(1.0)
+                .custom_formatter(|v, _| if v >= DENOISE_FULL_DB as f64 { "full".into() } else { format!("{v:.0} dB") })
+                .custom_parser(|t| if t.trim() == "full" { Some(DENOISE_FULL_DB as f64) } else { t.trim().trim_end_matches("dB").trim().parse().ok() }),
+        )
+        .on_hover_text("The most the noise is turned down. Lower sounds more natural but leaves some noise.");
+    });
+    for (label, peak) in [("in", reading.map(|r| r.in_peak)), ("out", reading.map(|r| r.out_peak))] {
+        ui.horizontal(|ui| {
+            let (rect, _) = ui.allocate_exact_size(vec2(200.0, 6.0), Sense::hover());
+            meter_bar(ui.painter(), rect, peak);
+            ui.label(RichText::new(label).small().weak());
+        });
+    }
+    ui.label(RichText::new(format!("adds about {} ms of delay · needs 48 kHz", d.model.delay_ms())).small().weak());
+}
+
+/// A node's delay in its title bar: what it adds (`+40`) and how late the audio is there, counted
+/// from where it entered the graph. Where the audio ends up (devices, programs recording) that's
+/// the total. Amber when one sound gets there twice at different delays.
+fn delay_badge(ui: &mut Ui, kind: &NodeKind, d: &NodeDelay) {
+    // Where nothing leaves (or what leaves is unrelated, as with a program), show what arrives.
+    let end = kind.outputs() == 0 || matches!(kind, NodeKind::App { .. });
+    let at = if end { d.arriving } else { d.leaving };
+    let Some(at) = at else {
+        if d.own > 0 {
+            ui.label(RichText::new(format!("+{} ms", d.own)).small().color(GREY))
+                .on_hover_text("Delay this node adds. Nothing reaches it right now.");
+        }
+        return;
+    };
+    let range = if at.min == at.max { format!("{} ms", at.max) } else { format!("{}–{} ms", at.min, at.max) };
+    let mut text = if d.own > 0 { format!("+{} · {range}", d.own) } else { range.clone() };
+    if end {
+        text = format!("Σ {text}");
+    }
+    let color = if at.doubled {
+        AMBER
+    } else if at.max > 0 || d.own > 0 {
+        Color32::from_rgb(120, 190, 240)
+    } else {
+        GREY
+    };
+    if at.doubled {
+        text = format!("⚠ {text}");
+    }
+    let mut hover = String::new();
+    if d.own > 0 {
+        hover += &format!("This node adds {} ms.\n", d.own);
+    }
+    hover += &if end {
+        format!("Audio gets here {range} after entering the graph: the total delay of this path.")
+    } else {
+        format!("Audio leaves here {range} after entering the graph.")
+    };
+    if at.min != at.max && !at.doubled {
+        hover += "\nDifferent sources take different paths here; each one arrives once.";
+    }
+    if at.doubled {
+        hover += "\n\nThe same sound gets here over paths with different delays. Mixed together, \
+            that sounds hollow or like an echo.";
+    }
+    hover += "\n\nCounts only processing in this graph; PipeWire's buffer and the devices add a few ms more.";
+    ui.label(RichText::new(text).color(color)).on_hover_text(hover);
 }
 
 /// A neutral starting point: four bells spread over the spectrum, all at 0 dB.

@@ -1,3 +1,4 @@
+mod denoise;
 mod dsp;
 mod engine;
 mod filter;
