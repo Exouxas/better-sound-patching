@@ -6,6 +6,7 @@ Search for `bsp:` in `src/ui.rs` to find every change.
 - A left-drag on the background draws a selection box (upstream requires Shift).
   Shift adds to the selection, Ctrl removes from it.
 - The view pans with a right-drag or middle-drag instead of a left-drag.
+- The scroll wheel zooms at the pointer without holding Ctrl (upstream: scrolling pans the view).
 - Pressing a node selects it. A click without dragging selects only that node.
   Shift-click toggles a node, Ctrl-click removes it.
 - Clicking empty space clears the selection.

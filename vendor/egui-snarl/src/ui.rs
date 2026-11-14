@@ -4,7 +4,7 @@ use std::collections::HashMap;
 
 use egui::{
     Align, Color32, CornerRadius, Frame, Id, LayerId, Layout, Margin, Modifiers, PointerButton,
-    Pos2, Rect, Scene, Sense, Shape, Stroke, StrokeKind, Style, Ui, UiBuilder, UiKind, UiStackInfo,
+    Pos2, Rect, Sense, Shape, Stroke, StrokeKind, Style, Ui, UiBuilder, UiKind, UiStackInfo,
     Vec2,
     collapsing_header::paint_default_icon,
     emath::{GuiRounding, TSTransform},
@@ -1033,11 +1033,8 @@ where
     clamp_scale(&mut to_global, min_scale, max_scale, ui_rect);
 
     let mut snarl_resp = ui.response();
-    Scene::new()
-        .zoom_range(min_scale..=max_scale)
-        // bsp: left-drag on the background draws a selection box, so pan with right or middle.
-        .drag_pan_buttons(egui::containers::DragPanButtons::SECONDARY | egui::containers::DragPanButtons::MIDDLE)
-        .register_pan_and_zoom(&ui, &mut snarl_resp, &mut to_global);
+    // bsp: our own pan and zoom instead of `Scene::register_pan_and_zoom`, see `pan_and_zoom`.
+    pan_and_zoom(&ui, &mut snarl_resp, &mut to_global, min_scale..=max_scale);
 
     if snarl_resp.changed() {
         ui.ctx().request_repaint();
@@ -2697,6 +2694,32 @@ impl<T> Snarl<T> {
 }
 
 #[inline]
+/// bsp: pans with a right- or middle-drag (a left-drag on the background draws a selection
+/// box), and the scroll wheel zooms at the pointer without holding Ctrl. Upstream's `Scene`
+/// scrolls the view instead, and egui 0.36's `Scene` can't be told otherwise.
+fn pan_and_zoom(ui: &Ui, resp: &mut egui::Response, to_global: &mut TSTransform, range: std::ops::RangeInclusive<f32>) {
+    if resp.dragged_by(PointerButton::Secondary) || resp.dragged_by(PointerButton::Middle) {
+        to_global.translation += resp.drag_delta() * to_global.scaling;
+        resp.mark_changed();
+    }
+    let Some(pointer) = ui.input(|i| i.pointer.latest_pos()) else { return };
+    if !resp.contains_pointer() {
+        return;
+    }
+    let speed = ui.ctx().options(|o| o.input_options.scroll_zoom_speed);
+    let (zoom, scroll) = ui.input(|i| (i.zoom_delta(), i.smooth_scroll_delta()));
+    // Ctrl+scroll and pinch already arrive as `zoom`; plain scrolling is added on top.
+    let zoom = zoom * ((scroll.x + scroll.y) * speed).exp();
+    if zoom == 1.0 {
+        return;
+    }
+    let zoom = zoom.clamp(range.start() / to_global.scaling, range.end() / to_global.scaling);
+    let at = (to_global.inverse() * pointer).to_vec2();
+    *to_global = *to_global * TSTransform::from_translation(at) * TSTransform::from_scaling(zoom) * TSTransform::from_translation(-at);
+    to_global.scaling = to_global.scaling.clamp(*range.start(), *range.end());
+    resp.mark_changed();
+}
+
 fn clamp_scale(to_global: &mut TSTransform, min_scale: f32, max_scale: f32, ui_rect: Rect) {
     if to_global.scaling >= min_scale && to_global.scaling <= max_scale {
         return;
