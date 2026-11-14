@@ -215,6 +215,7 @@ fn spawn_level_poller(ctx: egui::Context, readings: Arc<Mutex<BTreeMap<String, R
                         out_peak: r.out_peak.max(prev.out_peak * fall),
                         gate: r.gate,
                         limit: r.limit.min(1.0 - (1.0 - prev.limit) * 0.9),
+                        voice: r.voice.max(prev.voice * 0.8),
                     },
                 );
             }

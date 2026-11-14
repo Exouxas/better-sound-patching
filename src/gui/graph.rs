@@ -472,7 +472,7 @@ fn approx_size(kind: &NodeKind) -> egui::Vec2 {
         NodeKind::Eq(_) => vec2(340.0, 340.0),
         NodeKind::Levels(_) => vec2(320.0, 160.0),
         NodeKind::Volume(_) => vec2(320.0, 110.0),
-        NodeKind::Denoise(_) => vec2(320.0, 170.0),
+        NodeKind::Denoise(_) => vec2(320.0, 215.0),
         NodeKind::SwitchOutput { pins, .. } | NodeKind::SwitchInput { pins, .. } => vec2(360.0, 110.0 + 26.0 * pins.len() as f32),
         _ => vec2(290.0, 120.0),
     }
@@ -1029,6 +1029,37 @@ fn denoise_editor(ui: &mut Ui, d: &mut DenoiseSpec, reading: Option<Reading>) {
         )
         .on_hover_text("The most the noise is turned down. Lower sounds more natural but leaves some noise.");
     });
+    ui.horizontal(|ui| {
+        ui.checkbox(&mut d.gate, "Voice gate")
+            .on_hover_text("Silences everything between words. It opens a little before you start speaking, so words aren't cut, without adding delay.");
+        ui.add_enabled_ui(d.gate, |ui| {
+            let mut pct = d.gate_threshold * 100.0;
+            ui.add(egui::DragValue::new(&mut pct).range(1.0..=99.0).speed(0.5).suffix(" %"))
+                .on_hover_text("How sure it must be that you're speaking. Raise it if noise gets through, lower it if quiet words get cut.");
+            d.gate_threshold = pct / 100.0;
+            ui.label("hold");
+            ui.add(egui::DragValue::new(&mut d.gate_hold_ms).range(0.0..=2000.0).speed(5.0).suffix(" ms"))
+                .on_hover_text("How long it stays open after you stop speaking.");
+        });
+    });
+    if d.gate {
+        ui.horizontal(|ui| {
+            let (rect, resp) = ui.allocate_exact_size(vec2(200.0, 6.0), Sense::hover());
+            let p = ui.painter();
+            p.rect_filled(rect, 2.0, Color32::from_gray(45));
+            let open = reading.is_some_and(|r| r.gate > 0.5);
+            if let Some(r) = reading {
+                let mut bar = rect;
+                bar.set_width(rect.width() * r.voice.clamp(0.0, 1.0));
+                p.rect_filled(bar, 2.0, if open { GREEN } else { GREY });
+            }
+            let x = rect.left() + rect.width() * d.gate_threshold;
+            p.vline(x, rect.expand(2.0).y_range(), Stroke::new(2.0, Color32::from_rgb(110, 170, 250)));
+            resp.on_hover_text("How likely it is that you're speaking. The blue line is the threshold.");
+            let (t, c) = if open { ("open", GREEN) } else { ("closed", GREY) };
+            ui.label(RichText::new(t).small().color(c));
+        });
+    }
     for (label, peak) in [("in", reading.map(|r| r.in_peak)), ("out", reading.map(|r| r.out_peak))] {
         ui.horizontal(|ui| {
             let (rect, _) = ui.allocate_exact_size(vec2(200.0, 6.0), Sense::hover());

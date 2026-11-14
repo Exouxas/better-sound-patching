@@ -2,7 +2,7 @@
 //! audio EQ cookbook), level meter with gate and limiter, and volume. No PipeWire here, so it's
 //! unit-testable. Everything that runs per sample is allocation-free.
 
-use crate::denoise::Denoiser;
+use crate::denoise::{Denoiser, GateParams};
 use crate::model::{Band, BandKind, FilterSpec, MAX_BANDS};
 use std::f64::consts::PI;
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -155,6 +155,8 @@ pub struct Meter {
     gate: AtomicU32,
     /// Lowest limiter gain since the last read (1 = not limiting).
     limit: AtomicU32,
+    /// Highest chance of speech since the last read (noise suppression's voice gate).
+    voice: AtomicU32,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
@@ -163,6 +165,8 @@ pub struct Reading {
     pub out_peak: f32,
     pub gate: f32,
     pub limit: f32,
+    #[serde(default)]
+    pub voice: f32,
 }
 
 impl Meter {
@@ -179,7 +183,8 @@ impl Meter {
             better.then_some(v.to_bits())
         });
     }
-    pub fn record(&self, in_peak: f32, out_peak: f32, gate: f32, limit: f32) {
+    pub fn record(&self, in_peak: f32, out_peak: f32, gate: f32, limit: f32, voice: f32) {
+        Self::update(&self.voice, voice, true);
         Self::update(&self.in_peak, in_peak, true);
         Self::update(&self.out_peak, out_peak, true);
         Self::update(&self.gate, gate, false);
@@ -188,7 +193,7 @@ impl Meter {
     /// Everything since the last call.
     pub fn take(&self) -> Reading {
         let get = |c: &AtomicU32, reset: f32| f32::from_bits(c.swap(reset.to_bits(), Ordering::Relaxed));
-        Reading { in_peak: get(&self.in_peak, 0.0), out_peak: get(&self.out_peak, 0.0), gate: get(&self.gate, 1.0), limit: get(&self.limit, 1.0) }
+        Reading { in_peak: get(&self.in_peak, 0.0), out_peak: get(&self.out_peak, 0.0), gate: get(&self.gate, 1.0), limit: get(&self.limit, 1.0), voice: get(&self.voice, 0.0) }
     }
 }
 
@@ -211,7 +216,7 @@ pub enum Params {
     Eq(EqParams),
     Levels { gate: Option<f32>, limit: Option<f32> },
     Volume { gain: f32 },
-    Denoise { reduction_db: f32, enabled: bool },
+    Denoise { reduction_db: f32, enabled: bool, gate: Option<GateParams> },
 }
 
 impl Params {
@@ -223,7 +228,11 @@ impl Params {
                 limit: l.limit_on.then(|| db_to_lin(l.limit_db)),
             },
             FilterSpec::Volume(v) => Params::Volume { gain: v.gain.clamp(0.0, crate::model::MAX_VOLUME) },
-            FilterSpec::Denoise(d) => Params::Denoise { reduction_db: d.reduction_db, enabled: d.enabled },
+            FilterSpec::Denoise(d) => Params::Denoise {
+                reduction_db: d.reduction_db,
+                enabled: d.enabled,
+                gate: d.gate.then_some(GateParams { threshold: d.gate_threshold, hold_ms: d.gate_hold_ms }),
+            },
         }
     }
 }
@@ -266,9 +275,10 @@ impl Processor {
                 c.set(p, rate as f64);
             }
         }
-        if let (Params::Denoise { reduction_db, enabled }, Some(d)) = (params, &mut self.denoiser) {
+        if let (Params::Denoise { reduction_db, enabled, gate }, Some(d)) = (params, &mut self.denoiser) {
             d.set_reduction(reduction_db);
             d.set_enabled(enabled);
+            d.set_gate(gate);
         }
     }
 
@@ -278,7 +288,7 @@ impl Processor {
         let n = (0..ch).map(|c| ins[c].len().min(outs[c].len())).min().unwrap_or(0);
         let peak = |bufs: &[&[f32]]| bufs.iter().flat_map(|b| b.iter()).fold(0f32, |m, v| m.max(v.abs()));
         let in_peak = peak(ins);
-        let (mut min_gate, mut min_limit) = (1f32, 1f32);
+        let (mut min_gate, mut min_limit, mut voice) = (1f32, 1f32, 0f32);
         match self.params {
             Params::Eq(_) => {
                 for c in 0..ch {
@@ -287,7 +297,10 @@ impl Processor {
             }
             Params::Denoise { .. } => match &mut self.denoiser {
                 // The models only know 48 kHz audio; anything else passes as it is.
-                Some(d) if self.rate == crate::denoise::RATE => d.process(&ins[..ch], &mut outs[..ch]),
+                Some(d) if self.rate == crate::denoise::RATE => {
+                    d.process(&ins[..ch], &mut outs[..ch]);
+                    (min_gate, voice) = d.take_activity();
+                }
                 _ => {
                     for c in 0..ch {
                         outs[c][..n].copy_from_slice(&ins[c][..n]);
@@ -347,7 +360,7 @@ impl Processor {
             }
         }
         let out_peak = outs.iter().take(ch).flat_map(|b| b[..n].iter()).fold(0f32, |m, v| m.max(v.abs()));
-        meter.record(in_peak, out_peak, min_gate, min_limit);
+        meter.record(in_peak, out_peak, min_gate, min_limit, voice);
     }
 }
 

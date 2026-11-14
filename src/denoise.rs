@@ -7,6 +7,10 @@
 //! Everything is set up in [`Denoiser::new`] (off the realtime thread). RNNoise then runs without
 //! allocating; DeepFilterNet's inference library may allocate small buffers per frame, which
 //! costs far less than a frame lasts (about 0.15 ms per 10 ms on a desktop CPU).
+//!
+//! An optional voice gate ([`VoiceGate`]) silences the output between words. It goes by RNNoise's
+//! guess, per frame, of whether someone is speaking; with the other models a separate RNNoise
+//! runs just for that guess (about 0.04 ms per frame).
 
 use crate::dpdfnet;
 use crate::dsp::MAX_CH;
@@ -81,6 +85,68 @@ enum Engine {
     DpdfNet(Box<dpdfnet::Worker>),
 }
 
+/// Voice gate settings.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct GateParams {
+    /// Frames RNNoise rates less likely than this to hold speech are silenced (0–1).
+    pub threshold: f32,
+    /// How long the gate stays open after the voice stops, in ms.
+    pub hold_ms: f32,
+}
+
+/// Silences the output between words.
+///
+/// The voice guess is for the newest input frame, which is ahead of the output frame being made
+/// by the model's delay. That gives the gate a look-ahead for free: it opens that much before
+/// the voice arrives in the output, so the start of a word isn't cut, without adding delay.
+struct VoiceGate {
+    params: Option<GateParams>,
+    /// Input frames seen, and the last one rated as voice.
+    frame: u64,
+    last_voice: Option<u64>,
+    /// Current gain, 1 = open.
+    gain: f32,
+}
+
+impl VoiceGate {
+    /// Fades in over 5 ms and out over 50 ms.
+    const OPEN_STEP: f32 = 1.0 / 240.0;
+    const CLOSE_STEP: f32 = 1.0 / 2400.0;
+
+    fn new() -> Self {
+        VoiceGate { params: None, frame: 0, last_voice: None, gain: 1.0 }
+    }
+
+    /// One frame: `voice` is the guess for the newest input frame, which is `lead` frames ahead of
+    /// `out`. Returns the lowest gain used.
+    fn run(&mut self, voice: f32, lead: u64, out: &mut [[f32; HOP]]) -> f32 {
+        self.frame += 1;
+        let open = match self.params {
+            None => true,
+            Some(p) => {
+                if voice >= p.threshold {
+                    self.last_voice = Some(self.frame);
+                }
+                let hold = (p.hold_ms.max(0.0) / 10.0).ceil() as u64;
+                let shown = self.frame.saturating_sub(lead);
+                self.last_voice.is_some_and(|v| v + hold >= shown)
+            }
+        };
+        if open && self.gain == 1.0 {
+            return 1.0;
+        }
+        let mut lowest = self.gain;
+        for j in 0..HOP {
+            self.gain = if open { (self.gain + Self::OPEN_STEP).min(1.0) } else { (self.gain - Self::CLOSE_STEP).max(0.0) };
+            lowest = lowest.min(self.gain);
+            for o in out.iter_mut() {
+                o[j] *= self.gain;
+            }
+        }
+        lowest
+    }
+}
+
 pub struct Denoiser {
     engine: Engine,
     ch: usize,
@@ -103,6 +169,12 @@ pub struct Denoiser {
     /// switched back on, and the delay stays the same either way.
     bypass: f32,
     bypass_target: f32,
+    gate: VoiceGate,
+    /// RNNoise run only to tell voice from noise, for the models that aren't RNNoise.
+    detector: Option<RnNoise>,
+    /// Since the last [`Denoiser::take_activity`]: the gate's lowest gain and the highest voice guess.
+    gate_min: f32,
+    voice_max: f32,
 }
 
 impl Denoiser {
@@ -124,6 +196,7 @@ impl Denoiser {
                 (Engine::DeepFilter { df: Box::new(df), noisy: Array2::zeros((ch, HOP)), enhanced: Array2::zeros((ch, HOP)) }, delay)
             }
         };
+        let detector = if matches!(engine, Engine::RnNoise(_)) { None } else { Some(RnNoise::new()?) };
         let off = if enabled { 0.0 } else { 1.0 };
         let mut d = Denoiser {
             engine,
@@ -137,6 +210,10 @@ impl Denoiser {
             mix: 0.0,
             bypass: off,
             bypass_target: off,
+            gate: VoiceGate::new(),
+            detector,
+            gate_min: 1.0,
+            voice_max: 0.0,
         };
         d.set_reduction(reduction_db);
         Ok(d)
@@ -154,6 +231,18 @@ impl Denoiser {
     /// Off passes the audio unchanged, but delayed the same, so switching doesn't move it in time.
     pub fn set_enabled(&mut self, on: bool) {
         self.bypass_target = if on { 0.0 } else { 1.0 };
+    }
+
+    /// `None` lets everything through.
+    pub fn set_gate(&mut self, gate: Option<GateParams>) {
+        self.gate.params = gate;
+    }
+
+    /// The gate's lowest gain (1 = open) and the highest voice guess (0–1) since the last call.
+    pub fn take_activity(&mut self) -> (f32, f32) {
+        let a = (self.gate_min, self.voice_max);
+        (self.gate_min, self.voice_max) = (1.0, 0.0);
+        a
     }
 
     /// `ins` and `outs` have one slice per channel, all the same length. The output is the input
@@ -188,14 +277,21 @@ impl Denoiser {
         let start = (self.dry_at + len - self.delay) % len;
         let dry = |c: usize, j: usize, d: &Vec<Vec<f32>>| d[c][(start + j) % len];
         let mix = &self.mix;
+        let (mut x, mut y) = ([0f32; HOP], [0f32; HOP]);
+        let mut voice = 0f32;
+        if let Some(det) = &mut self.detector {
+            for (j, x) in x.iter_mut().enumerate() {
+                *x = (0..ch).map(|c| self.input[c][j]).sum::<f32>() / ch as f32 * I16;
+            }
+            voice = det.process(&mut y, &x);
+        }
         match &mut self.engine {
             Engine::RnNoise(states) => {
-                let (mut x, mut y) = ([0f32; HOP], [0f32; HOP]);
                 for c in 0..ch {
                     for (x, v) in x.iter_mut().zip(&self.input[c]) {
                         *x = v * I16;
                     }
-                    states[c].process(&mut y, &x);
+                    voice = voice.max(states[c].process(&mut y, &x));
                     for j in 0..HOP {
                         self.output[c][j] = y[j] / I16 * (1.0 - *mix) + dry(c, j, &self.dry) * *mix;
                     }
@@ -223,6 +319,9 @@ impl Denoiser {
                 }
             }
         }
+        let gain = self.gate.run(voice, (self.delay / HOP) as u64, &mut self.output[..ch]);
+        self.gate_min = self.gate_min.min(gain);
+        self.voice_max = self.voice_max.max(if voice.is_finite() { voice } else { 0.0 });
         if self.bypass > 0.0 || self.bypass_target > 0.0 {
             let step = 1.0 / HOP as f32;
             for j in 0..HOP {
@@ -362,6 +461,59 @@ mod tests {
             let out = run(&mut d, &noise);
             let db = 20.0 * (rms(&out[48000 * 5..]) / rms(&noise[48000 * 5..])).log10();
             assert!(db > -6.5, "{model:?}: limited to 6 dB but {db:.1} dB down");
+        }
+    }
+
+    #[test]
+    fn the_gate_opens_ahead_of_the_voice_and_holds_after_it() {
+        let gate = GateParams { threshold: 0.5, hold_ms: 100.0 };
+        let mut g = VoiceGate::new();
+        g.params = Some(gate);
+        // Voice in input frames 20..40, output 3 frames behind (as DeepFilterNet).
+        let lead = 3;
+        let mut gains = vec![];
+        for f in 1..=100u64 {
+            let mut out = [[1.0; HOP]];
+            g.run(if (20..40).contains(&f) { 0.9 } else { 0.1 }, lead, &mut out);
+            gains.push(out[0]);
+        }
+        let gain_at = |frame: u64, j: usize| gains[frame as usize - 1][j];
+        // Starts closing at once, closed after 50 ms.
+        assert!(gain_at(1, HOP - 1) < 1.0 && gain_at(6, 0) == 0.0);
+        // Output frame k shows input frame k - 3. Voice arrives in the output in frame 23 and the
+        // gate is already fully open from the frame before (opened 30 ms early).
+        assert_eq!(gain_at(19, HOP - 1), 0.0);
+        assert!(gain_at(20, HOP - 1) == 1.0 && gain_at(22, 0) == 1.0);
+        // Last voice shows in output frame 42; held 10 frames, then fades.
+        assert_eq!(gain_at(52, HOP - 1), 1.0);
+        assert!(gain_at(53, HOP - 1) < 1.0);
+        assert_eq!(gain_at(58, 0), 0.0);
+        // No jumps anywhere.
+        let all: Vec<f32> = gains.iter().flatten().copied().collect();
+        let jump = all.windows(2).map(|w| (w[1] - w[0]).abs()).fold(0f32, f32::max);
+        assert!(jump <= VoiceGate::OPEN_STEP + 1e-6, "jump {jump}");
+        // Switched off: opens again.
+        g.params = None;
+        let mut out = [[1.0; HOP]];
+        g.run(0.0, lead, &mut out);
+        assert!(out[0][HOP - 1] > 0.9);
+    }
+
+    #[test]
+    fn the_gate_silences_noise_with_every_model() {
+        for model in DenoiseModel::ALL {
+            // No reduction, so only the gate can take the hiss away.
+            let mut d = Denoiser::new(model, 1, 0.0, true).unwrap();
+            d.set_gate(Some(GateParams { threshold: 0.8, hold_ms: 200.0 }));
+            let noise = hiss(48000 * 2, 0.02);
+            let out = run(&mut d, &noise);
+            let (gate, voice) = d.take_activity();
+            assert!(out[48000..].iter().all(|v| *v == 0.0), "{model:?}: gate didn't close (voice {voice})");
+            assert_eq!(gate, 0.0, "{model:?}");
+            // Switching the node off still lets everything through.
+            d.set_enabled(false);
+            let out = run(&mut d, &noise);
+            assert!(rms(&out[48000..]) > 0.01, "{model:?}");
         }
     }
 

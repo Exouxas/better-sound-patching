@@ -222,11 +222,37 @@ pub struct DenoiseSpec {
     /// Off passes the audio unchanged (still delayed the same, so nothing shifts in time).
     #[serde(default = "yes")]
     pub enabled: bool,
+    /// Voice gate: silence between words.
+    #[serde(default)]
+    pub gate: bool,
+    /// Audio less likely than this to be speech is silenced (0–1).
+    #[serde(default = "gate_threshold")]
+    pub gate_threshold: f32,
+    /// How long the gate stays open after speech, in ms.
+    #[serde(default = "gate_hold_ms")]
+    pub gate_hold_ms: f32,
+}
+
+fn gate_threshold() -> f32 {
+    0.7
+}
+
+fn gate_hold_ms() -> f32 {
+    200.0
 }
 
 impl DenoiseSpec {
     pub fn new(name: &str) -> Self {
-        DenoiseSpec { name: name.into(), channels: Channels::Mono, model: DenoiseModel::default(), reduction_db: DENOISE_FULL_DB, enabled: true }
+        DenoiseSpec {
+            name: name.into(),
+            channels: Channels::Mono,
+            model: DenoiseModel::default(),
+            reduction_db: DENOISE_FULL_DB,
+            enabled: true,
+            gate: false,
+            gate_threshold: gate_threshold(),
+            gate_hold_ms: gate_hold_ms(),
+        }
     }
 }
 
